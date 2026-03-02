@@ -50,4 +50,16 @@ Required env values:
 - `COINALYZE_SYMBOL`
 - `FRED_API_KEY`
 
+### Quick Start (run)
+
+```bash
+cd STRUCTURAL_BTC_ENGINE
+source ../.venv/bin/activate
+python btc_mispricing_engine.py run \
+  --model-path artifacts/models \
+  --model-cycle-seconds 60 \
+  --market-refresh-seconds 60 \
+  --require-live-factors
+```
+
 See `STRUCTURAL_BTC_ENGINE/README.md` for full usage and training commands.
