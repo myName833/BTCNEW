@@ -192,6 +192,10 @@ def main() -> None:
     ap.add_argument("--method", choices=["auto", "platt", "isotonic"], default="auto")
     ap.add_argument("--market-shrinkage", type=float, default=0.12)
     ap.add_argument("--min-samples", type=int, default=120)
+    ap.add_argument("--guardrail-ece-max", type=float, default=0.10, help="Guardrail threshold for ECE")
+    ap.add_argument("--guardrail-brier-max", type=float, default=0.26, help="Guardrail threshold for Brier")
+    ap.add_argument("--guardrail-avg-gap-max", type=float, default=0.05, help="Guardrail threshold for |avg_pred-actual|")
+    ap.add_argument("--save-best-anyway", action="store_true", help="Save best calibrator even if guardrails fail")
     args = ap.parse_args()
 
     if joblib is None or LogisticRegression is None or IsotonicRegression is None:
@@ -364,12 +368,12 @@ def main() -> None:
     final_brier = test_stage_summary["final"]["brier"]
     final_ece = test_stage_summary["final"]["ece"]
     guardrail_fail_reasons = []
-    if final_avg_gap > 0.05:
-        guardrail_fail_reasons.append(f"abs(avg_pred-actual)={final_avg_gap:.4f} > 0.05")
-    if final_brier > 0.26:
-        guardrail_fail_reasons.append(f"brier={final_brier:.4f} > 0.26")
-    if final_ece > 0.10:
-        guardrail_fail_reasons.append(f"ece={final_ece:.4f} > 0.10")
+    if final_avg_gap > float(args.guardrail_avg_gap_max):
+        guardrail_fail_reasons.append(f"abs(avg_pred-actual)={final_avg_gap:.4f} > {float(args.guardrail_avg_gap_max):.4f}")
+    if final_brier > float(args.guardrail_brier_max):
+        guardrail_fail_reasons.append(f"brier={final_brier:.4f} > {float(args.guardrail_brier_max):.4f}")
+    if final_ece > float(args.guardrail_ece_max):
+        guardrail_fail_reasons.append(f"ece={final_ece:.4f} > {float(args.guardrail_ece_max):.4f}")
     guardrail_pass = len(guardrail_fail_reasons) == 0
 
     metrics = {
@@ -406,9 +410,9 @@ def main() -> None:
             "pass": guardrail_pass,
             "reasons": guardrail_fail_reasons,
             "criteria": {
-                "abs_avg_pred_minus_actual_le": 0.05,
-                "brier_le": 0.26,
-                "ece_le": 0.10,
+                "abs_avg_pred_minus_actual_le": float(args.guardrail_avg_gap_max),
+                "brier_le": float(args.guardrail_brier_max),
+                "ece_le": float(args.guardrail_ece_max),
             },
         },
     }
@@ -455,7 +459,7 @@ def main() -> None:
         fig.savefig(out_dir / "reliability_curve_test.png", dpi=140)
         plt.close(fig)
 
-    if guardrail_pass:
+    if guardrail_pass or bool(args.save_best_anyway):
         joblib.dump(
             {
                 "calibrator": {
@@ -473,7 +477,10 @@ def main() -> None:
             },
             artifact_path,
         )
-        print(f"Saved calibrator: {artifact_path}")
+        if guardrail_pass:
+            print(f"Saved calibrator: {artifact_path}")
+        else:
+            print(f"Saved calibrator with guardrail override (--save-best-anyway): {artifact_path}")
     else:
         print("Guardrail failed: calibrator artifact NOT saved.")
         for rr in guardrail_fail_reasons:

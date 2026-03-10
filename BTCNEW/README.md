@@ -1,86 +1,178 @@
-# BTC Target Alert CLI
+# BTCNEW Target Alert
 
-`btc_target_alert.py` is a numeric-only Python CLI tool that computes BTC target-hit probabilities for both directions (`above` and `below`), evaluates edge vs market, logs runs, and sends Discord alerts.
+`btc_target_alert.py` supports:
 
-## Requirements
+- Kalshi-style target probability: `P(BTC final price > strike at expiry)`
+- Futures directional signals: expected return + LONG/SHORT/NO_TRADE over short horizons
 
-- Python 3.11+
-- Install dependencies:
+It evaluates edge vs market probabilities (Kalshi modes), applies optional probability calibration, logs results, and can run in manual, auto, or futures modes.
+
+## Setup
 
 ```bash
 cd BTCNEW
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
-```
-
-## Environment
-
-Copy and fill env values:
-
-```bash
 cp .env.example .env
 ```
 
-Main env keys:
-- `COINBASE_PRODUCT_ID` (default `BTC-USD`)
-- `COINBASE_API_KEY` (optional)
-- `COINALYZE_API_KEY` (optional but recommended)
-- `FRED_API_KEY` (optional)
-- `ALERT_WEBHOOK_URL` (optional)
-- `CALIBRATOR_ARTIFACT_PATH` (optional override for a trained calibrator artifact)
+## Key `.env` Variables
 
-## CLI (numeric-only)
+- `COINBASE_PRODUCT_ID` (default: `BTC-USD`)
+- `COINALYZE_API_KEY` (recommended)
+- `FRED_API_KEY` (optional)
+- `ALERT_WEBHOOK_URL` (Discord webhook)
+- `KALSHI_API_KEY` / `KALSHI_API_TOKEN` / `KALSHI_API_BASE` (for live market scan)
+- `CALIBRATOR_ARTIFACT_PATH` (optional override; default artifact path is used if omitted)
+- `FUTURES_EXCHANGE` (optional: `binance`, `bybit`, `okx` to augment futures features)
+- `FUTURES_OVERRIDE_FEATURES` (default: `true` to override funding/OI/liquidation/orderbook with futures data)
+- `BINANCE_FUTURES_SYMBOL` (default: `BTCUSDT`)
+- `BYBIT_FUTURES_SYMBOL` (default: `BTCUSDT`)
+- `OKX_FUTURES_SYMBOL` (default: `BTC-USDT-SWAP`)
+
+## Modes
+
+### 1) Manual mode (single run)
+
+```bash
+python btc_target_alert.py --mode manual --target 71250 --timeframe 60
+```
+
+Interactive:
+
+```bash
+python btc_target_alert.py --mode manual --interactive
+```
+
+### 2) Auto mode (live Kalshi scan)
+
+Scans live BTC Kalshi markets every minute, filters low-quality markets, runs BTCNEW model, and alerts Discord when edge passes threshold.
 
 ```bash
 python btc_target_alert.py \
-  --target 67500 \
-  --timeframe 53 \
-  --bankroll 1000 \
-  --edge-threshold 0.03 \
-  --plot
+  --mode auto \
+  --timeframe 60 \
+  --poll-seconds 60 \
+  --edge-threshold 0.04
 ```
 
-Arguments:
-- `--target` float (USD)
-- `--timeframe` int (minutes)
-- `--bankroll` float (optional)
-- `--stake` float (optional)
-- `--edge-threshold` float (default `0.03`)
-- `--plot` optional chart output
+Useful auto flags:
+- `--market-prob-min` / `--market-prob-max` (default `0.03` / `0.97`)
+- `--max-spread` (default `0.12`)
+- `--min-expiry-minutes` / `--max-expiry-minutes` (default `2` / `180`)
+- `--max-cycles` (for short test runs)
 
-Interactive mode:
+### 3) Futures mode (directional signal)
+
+Generates LONG/SHORT/NO_TRADE signals using expected return, confidence, and signal strength.
 
 ```bash
-python btc_target_alert.py --interactive
+python btc_target_alert.py \
+  --mode futures \
+  --timeframe 30 \
+  --leverage 10
 ```
 
-## Function call
+Useful futures flags:
+- `--return-threshold` (expected return threshold, default `0.0015`)
+- `--min-confidence` (default `0.60`)
+- `--min-signal-strength` (default `0.40`)
+- `--take-profit-mult` (default `1.20`)
+- `--stop-loss-mult` (default `0.70`)
+
+## Model Features (Current)
+
+- Vol-normalized distance:
+  - `distance_vol_normalized_signed`
+  - `distance_vol_normalized_abs`
+- Momentum:
+  - `return_1m`, `return_3m`, `return_5m`, `return_10m`, `momentum_acceleration`
+- Realized volatility:
+  - `vol_1m`, `vol_5m`, `vol_15m`, `realized_vol_annual`, `realized_vol_expansion`
+- Time decay:
+  - `minutes_remaining`, `sqrt_time_remaining`, `time_adjusted_distance`
+- Position/trend:
+  - `distance_to_high_15m`, `distance_to_low_15m`, `distance_to_vwap`
+  - `price_minus_ema_3`, `price_minus_ema_10`, `ema_3_minus_ema_10`
+- Near-strike specialization:
+  - dedicated near-strike weight set when distance is very small
+- Distribution layer:
+  - `expected_final_price`, `expected_variance`, and distribution-based probability blend
+
+## Decision Rules
+
+Validation action (`BET_YES` or `NO_BET`) uses distance buckets:
+
+- `<0.15%`: require `prob >= 0.68` and `edge >= 0.07`
+- `<0.30%`: require `prob >= 0.65` and `edge >= 0.05`
+- `<0.60%`: require `prob >= 0.60` and `edge >= 0.04`
+- `>=0.60%`: require `prob >= 0.57` and `edge >= 0.03`
+
+Auto Discord alerts are typically gated by `--edge-threshold 0.04`.
+
+## Confidence
+
+Confidence now uses a reliability score (not only raw probability), based on:
+- probability separation from 50/50
+- vol-normalized distance strength
+- agreement across model components
+- short-term volatility noise
+- calibration availability
+- warning penalties
+
+Outputs include:
+- `confidence_score`
+- `confidence_tier` (`LOW` / `MEDIUM` / `HIGH` / `VERY_HIGH`)
+
+## Calibration
+
+Train calibrator from resolved logs:
+
+```bash
+MPLCONFIGDIR=artifacts/tmp_mpl MPLBACKEND=Agg python calibration_audit.py \
+  --log artifacts/logs/query_log.csv \
+  --artifact artifacts/models/btcnew_calibrator.joblib \
+  --method auto \
+  --min-samples 100
+```
+
+If you want to save best calibrator even when guardrails fail:
+
+```bash
+MPLCONFIGDIR=artifacts/tmp_mpl MPLBACKEND=Agg python calibration_audit.py \
+  --log artifacts/logs/query_log.csv \
+  --artifact artifacts/models/btcnew_calibrator.joblib \
+  --method auto \
+  --min-samples 100 \
+  --save-best-anyway
+```
+
+Guardrail tuning flags are available:
+- `--guardrail-ece-max`
+- `--guardrail-brier-max`
+- `--guardrail-avg-gap-max`
+
+## Outputs
+
+- Terminal summary (raw + calibrated probabilities)
+- Discord alert (raw/calibrated/market shown)
+- Latest JSON: `artifacts/latest/latest_alert.json`
+- Query log CSV: `artifacts/logs/query_log.csv`
+- Futures log CSV: `artifacts/logs/futures_query_log.csv`
+- Optional chart PNGs: `artifacts/charts/`
+- Resolved outcome updates are written back into query log for calibration
+
+## Python API
 
 ```python
 from btc_target_alert import run_btc_target_alert
 
 result = run_btc_target_alert(
-    target_price=67500.0,
-    timeframe_minutes=53,
+    target_price=71250.0,
+    timeframe_minutes=60,
     bankroll=1000.0,
-    edge_threshold=0.03,
+    edge_threshold=0.04,
     plot=False,
 )
 ```
-
-## Outputs
-
-- Terminal summary with both above/below probabilities and edges.
-- Includes raw model probability and calibrated model probability.
-- Discord embed alert to `ALERT_WEBHOOK_URL`.
-- JSON artifact: `artifacts/latest/latest_alert.json`
-- CSV query log: `artifacts/logs/query_log.csv`
-- Optional chart PNG: `artifacts/charts/`
-- Auto-resolution of past rows + historical accuracy and Brier score.
-
-## Notes
-
-- Missing APIs degrade gracefully: warnings are logged and neutral factors are used.
-- If spot/ticker endpoint fails, script attempts candle-close fallback.
-- Calibrator loading uses structural artifact format (`{\"method\": ..., \"model\": ...}`), with fallback to no calibration if no artifact is found.

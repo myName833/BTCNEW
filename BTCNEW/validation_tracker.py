@@ -25,7 +25,7 @@ import pandas as pd
 import requests
 from dotenv import load_dotenv
 
-from btc_target_alert import BTCAlert
+from btc_target_alert import BTCProbabilityAlertApp
 
 FULL_COLUMNS = [
     "timestamp_prediction",
@@ -325,7 +325,15 @@ class ValidationTracker:
         self.directional_report_json = self.out_dir / "directional_validation_report.json"
         self.cfg = cfg
         self.kalshi = KalshiClient()
-        self.model = BTCAlert(Path(__file__).resolve().parent)
+        self.model = BTCProbabilityAlertApp(Path(__file__).resolve().parent)
+        self.model._ensure_calibrator_loaded([])
+
+    def _calibrate_yes_probability(self, raw_yes: float) -> float:
+        try:
+            cal = self.model.apply_calibrator(self.model._calibrator, np.array([float(raw_yes)], dtype=float))
+            return float(np.clip(float(cal[0]), 1e-6, 1.0 - 1e-6))
+        except Exception:
+            return float(np.clip(float(raw_yes), 1e-6, 1.0 - 1e-6))
 
     @staticmethod
     def _now_iso() -> str:
@@ -565,7 +573,7 @@ class ValidationTracker:
         now = pd.Timestamp.now(tz="UTC")
         warnings: List[str] = []
         try:
-            spot = float(self.model._fetch_spot(warnings))
+            spot = float(self.model._fetch_spot_price(warnings))
         except Exception:
             return {"generated_strikes": 0, "new_logged": 0, "evaluated": 0}
 
@@ -582,7 +590,7 @@ class ValidationTracker:
             for _, r in key_df.iterrows():
                 existing.add((str(r["expiry_time"]), float(pd.to_numeric(pd.Series([r["strike"]]), errors="coerce").iloc[0])))
 
-        factors = self.model._factors(horizon, warnings=[])
+        factors = self.model._collect_factors(horizon, warnings=[])
         annual_vol = max(float(factors.get("realized_vol_annual", 0.55)), 0.08)
         rows: List[Dict[str, Any]] = []
 
@@ -595,7 +603,7 @@ class ValidationTracker:
             if self.cfg.pure_model:
                 model_yes = float(np.clip(raw_yes, 1e-6, 1 - 1e-6))
             else:
-                model_yes = float(self.model._post_process_probability(raw_yes, market_prob=market_yes))
+                model_yes = self._calibrate_yes_probability(raw_yes)
             predicted_yes = int(model_yes >= float(self.cfg.directional_yes_threshold))
             pred_dir = "YES" if predicted_yes == 1 else "NO"
             entry = float(market_yes if predicted_yes == 1 else (1.0 - market_yes))
@@ -844,7 +852,7 @@ class ValidationTracker:
         now = pd.Timestamp.now(tz="UTC")
         warnings: List[str] = []
         try:
-            spot = float(self.model._fetch_spot(warnings))
+            spot = float(self.model._fetch_spot_price(warnings))
         except Exception:
             return {"seen_markets": len(markets), "active_group_markets": 0, "evaluated": 0, "new_logged": 0}
 
@@ -878,12 +886,12 @@ class ValidationTracker:
 
             horizon = max(1, int(round(mins)))
             if horizon not in factors_cache:
-                factors_cache[horizon] = self.model._factors(horizon, warnings=[])
+                factors_cache[horizon] = self.model._collect_factors(horizon, warnings=[])
             factors = factors_cache[horizon]
 
             annual_vol = max(float(factors.get("realized_vol_annual", 0.55)), 0.08)
             raw_above = self.model._model_probability(spot, strike, horizon, annual_vol, "above", factors)
-            model_above = float(self.model._post_process_probability(raw_above, market_prob=None))
+            model_above = self._calibrate_yes_probability(raw_above)
             yes_is_above = self._yes_represents_above(str(m.get("market_title", "")), mid)
             model_yes = model_above if yes_is_above else float(np.clip(1.0 - model_above, 1e-6, 1 - 1e-6))
 
