@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Virtual environments
+.venv/
+venv/
+**/.venv/
+**/venv/
+
+# Environment files (keep example)
+.env
+.env.*
+!.env.example
+
+# Artifacts / outputs
+**/artifacts/
+**/artifacts/**
+**/logs/
+**/latest/
+**/charts/
+**/tmp_mpl/
+**/diagnostics/
+**/validation/
+
+# Notebooks
+.ipynb_checkpoints/
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+
+# Logs
+*.log
