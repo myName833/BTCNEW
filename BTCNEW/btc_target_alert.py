@@ -41,6 +41,7 @@ FEAR_GREED_URL = "https://api.alternative.me/fng/?limit=1&format=json"
 BINANCE_FUTURES_BASE = "https://fapi.binance.com"
 BYBIT_BASE = "https://api.bybit.com"
 OKX_BASE = "https://www.okx.com"
+BYDFI_BASE = "https://open-api.bydoxe.com"
 
 
 class BTCProbabilityAlertApp:
@@ -287,6 +288,9 @@ class BTCProbabilityAlertApp:
         min_signal_strength: float = 0.40,
         take_profit_mult: float = 1.20,
         stop_loss_mult: float = 0.70,
+        contract_check: bool = False,
+        maintenance_margin_rate: float = 0.005,
+        taker_fee_bps: float = 5.0,
         plot: bool = False,
     ) -> Dict[str, Any]:
         if timeframe_minutes <= 0:
@@ -301,6 +305,10 @@ class BTCProbabilityAlertApp:
             raise ValueError("min_signal_strength must be >= 0")
         if take_profit_mult <= 0 or stop_loss_mult <= 0:
             raise ValueError("take_profit_mult/stop_loss_mult must be > 0")
+        if maintenance_margin_rate < 0 or maintenance_margin_rate >= 1:
+            raise ValueError("maintenance_margin_rate must be in [0, 1)")
+        if taker_fee_bps < 0:
+            raise ValueError("taker_fee_bps must be >= 0")
 
         result = self._compute_futures(
             timeframe_minutes=timeframe_minutes,
@@ -310,6 +318,9 @@ class BTCProbabilityAlertApp:
             min_signal_strength=min_signal_strength,
             take_profit_mult=take_profit_mult,
             stop_loss_mult=stop_loss_mult,
+            contract_check=contract_check,
+            maintenance_margin_rate=maintenance_margin_rate,
+            taker_fee_bps=taker_fee_bps,
         )
         self._print_futures_summary(result)
 
@@ -845,6 +856,9 @@ class BTCProbabilityAlertApp:
         min_signal_strength: float,
         take_profit_mult: float,
         stop_loss_mult: float,
+        contract_check: bool,
+        maintenance_margin_rate: float,
+        taker_fee_bps: float,
     ) -> Dict[str, Any]:
         warnings: List[str] = []
         now_utc = datetime.now(timezone.utc)
@@ -908,6 +922,53 @@ class BTCProbabilityAlertApp:
             take_profit = None
             stop_loss = None
 
+        fee_roundtrip_bps = float(max(taker_fee_bps, 0.0) * 2.0)
+        fee_roundtrip_fraction = fee_roundtrip_bps / 10000.0
+
+        estimated_liquidation_price: Optional[float] = None
+        distance_to_liquidation_pct: Optional[float] = None
+        take_profit_unlevered_pct: Optional[float] = None
+        stop_loss_unlevered_pct: Optional[float] = None
+        take_profit_pnl_pct_levered_net: Optional[float] = None
+        stop_loss_pnl_pct_levered_net: Optional[float] = None
+        stop_within_liquidation_buffer: Optional[bool] = None
+
+        if direction == "LONG" and take_profit is not None and stop_loss is not None:
+            estimated_liquidation_price = float(
+                entry_price * (1.0 - (1.0 / max(leverage, EPS)) + float(maintenance_margin_rate))
+            )
+            distance_to_liquidation_pct = float(
+                max((entry_price - estimated_liquidation_price) / max(entry_price, EPS), 0.0)
+            )
+            take_profit_unlevered_pct = float((take_profit - entry_price) / max(entry_price, EPS))
+            stop_loss_unlevered_pct = float((stop_loss - entry_price) / max(entry_price, EPS))
+            take_profit_pnl_pct_levered_net = float(take_profit_unlevered_pct * leverage - fee_roundtrip_fraction)
+            stop_loss_pnl_pct_levered_net = float(stop_loss_unlevered_pct * leverage - fee_roundtrip_fraction)
+            stop_within_liquidation_buffer = bool(stop_loss > estimated_liquidation_price)
+        elif direction == "SHORT" and take_profit is not None and stop_loss is not None:
+            estimated_liquidation_price = float(
+                entry_price * (1.0 + (1.0 / max(leverage, EPS)) - float(maintenance_margin_rate))
+            )
+            distance_to_liquidation_pct = float(
+                max((estimated_liquidation_price - entry_price) / max(entry_price, EPS), 0.0)
+            )
+            take_profit_unlevered_pct = float((entry_price - take_profit) / max(entry_price, EPS))
+            stop_loss_unlevered_pct = float((entry_price - stop_loss) / max(entry_price, EPS))
+            take_profit_pnl_pct_levered_net = float(take_profit_unlevered_pct * leverage - fee_roundtrip_fraction)
+            stop_loss_pnl_pct_levered_net = float(stop_loss_unlevered_pct * leverage - fee_roundtrip_fraction)
+            stop_within_liquidation_buffer = bool(stop_loss < estimated_liquidation_price)
+
+        if contract_check and leverage >= 50:
+            warnings.append(
+                "High-leverage contract check enabled. Verify exchange maintenance margin tiers and liquidation formula before live trading."
+            )
+        if contract_check and distance_to_liquidation_pct is not None and distance_to_liquidation_pct < 0.02:
+            warnings.append(
+                f"Liquidation buffer is thin: {distance_to_liquidation_pct * 100:.2f}% from entry at {leverage:.1f}x."
+            )
+        if contract_check and stop_within_liquidation_buffer is False:
+            warnings.append("Configured stop-loss is beyond estimated liquidation price.")
+
         result = {
             "mode": "futures",
             "timestamp_utc": now_utc.isoformat(),
@@ -931,6 +992,16 @@ class BTCProbabilityAlertApp:
             "min_signal_strength": float(min_signal_strength),
             "take_profit_mult": float(take_profit_mult),
             "stop_loss_mult": float(stop_loss_mult),
+            "contract_check_enabled": bool(contract_check),
+            "maintenance_margin_rate": float(maintenance_margin_rate),
+            "fee_roundtrip_bps": float(fee_roundtrip_bps),
+            "estimated_liquidation_price": estimated_liquidation_price,
+            "distance_to_liquidation_pct": distance_to_liquidation_pct,
+            "take_profit_unlevered_pct": take_profit_unlevered_pct,
+            "stop_loss_unlevered_pct": stop_loss_unlevered_pct,
+            "take_profit_pnl_pct_levered_net": take_profit_pnl_pct_levered_net,
+            "stop_loss_pnl_pct_levered_net": stop_loss_pnl_pct_levered_net,
+            "stop_within_liquidation_buffer": stop_within_liquidation_buffer,
             "realized_volatility": float(realized_volatility),
             "expected_move": float(expected_move),
             "confidence_components": confidence_meta,
@@ -1605,6 +1676,8 @@ class BTCProbabilityAlertApp:
             return self._fetch_bybit_futures_factors(warnings)
         if provider == "okx":
             return self._fetch_okx_futures_factors(warnings)
+        if provider in {"bydfi", "bydoxe"}:
+            return self._fetch_bydfi_futures_factors(warnings)
         return {}
 
     def _fetch_binance_futures_factors(self, warnings: List[str]) -> Dict[str, float]:
@@ -1771,6 +1844,87 @@ class BTCProbabilityAlertApp:
                 out["futures_liquidation_pressure"] = float(total)
         except Exception as exc:
             warnings.append(f"OKX liquidation feed unavailable: {exc}")
+
+        return out
+
+    @staticmethod
+    def _bydfi_data(payload: Any) -> Any:
+        if not isinstance(payload, dict):
+            return None
+        code = str(payload.get("code", "")).strip()
+        if code and code not in {"00000", "0"}:
+            return None
+        return payload.get("data")
+
+    @staticmethod
+    def _bydfi_pick_symbol_rows(data: Any, symbol: str) -> List[Dict[str, Any]]:
+        if isinstance(data, dict):
+            rows = [data]
+        elif isinstance(data, list):
+            rows = [r for r in data if isinstance(r, dict)]
+        else:
+            return []
+        sym = symbol.strip().upper()
+        return [r for r in rows if str(r.get("symbol", "")).strip().upper() == sym] or rows
+
+    def _fetch_bydfi_futures_factors(self, warnings: List[str]) -> Dict[str, float]:
+        base = os.getenv("BYDFI_FUTURES_BASE", BYDFI_BASE).strip().rstrip("/")
+        symbol = os.getenv("BYDFI_FUTURES_SYMBOL", "BTCUSDT").strip().upper()
+        out: Dict[str, float] = {}
+
+        # Funding: latest historical funding rate.
+        try:
+            payload = self._safe_get_json(
+                f"{base}/api/v1/future/market/history-fund-rate",
+                params={"symbol": symbol, "limit": "1"},
+            )
+            data = self._bydfi_data(payload)
+            rows = self._bydfi_pick_symbol_rows(data, symbol)
+            if rows:
+                fr = rows[-1].get("fundingRate")
+                if fr is not None:
+                    out["futures_funding_rate"] = float(fr)
+        except Exception as exc:
+            warnings.append(f"BYDFi funding unavailable: {exc}")
+
+        # Open interest: only snapshot is exposed in public endpoint.
+        try:
+            payload = self._safe_get_json(
+                f"{base}/api/v1/future/market/open-interest",
+                params={"symbol": symbol},
+            )
+            data = self._bydfi_data(payload)
+            if isinstance(data, dict):
+                oi_list = data.get("openInterestList", []) if isinstance(data.get("openInterestList"), list) else []
+                if oi_list:
+                    row = oi_list[-1]
+                    size = row.get("size")
+                    if size is not None:
+                        out["futures_open_interest_size"] = float(size)
+        except Exception as exc:
+            warnings.append(f"BYDFi open interest unavailable: {exc}")
+
+        # Orderbook signal from best bid/ask ticker endpoint.
+        try:
+            payload = self._safe_get_json(
+                f"{base}/api/v1/future/market/book-ticker",
+                params={"symbol": symbol},
+            )
+            data = self._bydfi_data(payload)
+            rows = self._bydfi_pick_symbol_rows(data, symbol)
+            if rows:
+                row = rows[-1]
+                bid_p = float(row.get("bidPrice", 0.0))
+                ask_p = float(row.get("askPrice", 0.0))
+                bid_q = float(row.get("bidQty", 0.0))
+                ask_q = float(row.get("askQty", 0.0))
+                bid_notional = bid_p * bid_q
+                ask_notional = ask_p * ask_q
+                total = bid_notional + ask_notional + EPS
+                out["futures_orderbook_imbalance"] = float((bid_notional - ask_notional) / total)
+                out["futures_orderbook_ratio"] = float(bid_notional / (ask_notional + EPS))
+        except Exception as exc:
+            warnings.append(f"BYDFi orderbook unavailable: {exc}")
 
         return out
 
@@ -2634,6 +2788,24 @@ class BTCProbabilityAlertApp:
             print(f"Entry: ${result['entry_price']:,.2f}")
             print(f"Take Profit: ${result['take_profit']:,.2f}")
             print(f"Stop Loss: ${result['stop_loss']:,.2f}")
+        if result.get("contract_check_enabled"):
+            print("\nContract Check")
+            print(f"- Maintenance Margin Rate: {result['maintenance_margin_rate'] * 100:.3f}%")
+            print(f"- Roundtrip Fees Assumed: {result['fee_roundtrip_bps']:.2f} bps")
+            if result.get("estimated_liquidation_price") is not None:
+                print(f"- Est. Liquidation Price: ${result['estimated_liquidation_price']:,.2f}")
+            if result.get("distance_to_liquidation_pct") is not None:
+                print(f"- Distance to Liquidation: {result['distance_to_liquidation_pct'] * 100:.3f}%")
+            if result.get("take_profit_unlevered_pct") is not None:
+                print(f"- TP Move (Unlevered): {result['take_profit_unlevered_pct'] * 100:.3f}%")
+            if result.get("stop_loss_unlevered_pct") is not None:
+                print(f"- SL Move (Unlevered): {result['stop_loss_unlevered_pct'] * 100:.3f}%")
+            if result.get("take_profit_pnl_pct_levered_net") is not None:
+                print(f"- TP PnL (Levered Net Fees): {result['take_profit_pnl_pct_levered_net'] * 100:.3f}%")
+            if result.get("stop_loss_pnl_pct_levered_net") is not None:
+                print(f"- SL PnL (Levered Net Fees): {result['stop_loss_pnl_pct_levered_net'] * 100:.3f}%")
+            if result.get("stop_within_liquidation_buffer") is not None:
+                print(f"- Stop Within Liq Buffer: {result['stop_within_liquidation_buffer']}")
         if result["warnings"]:
             print("\nWarnings")
             for w in result["warnings"]:
@@ -2727,6 +2899,19 @@ class BTCProbabilityAlertApp:
                     f"**Stop Loss:** ${result['stop_loss']:,.2f}",
                 ]
             )
+        if result.get("contract_check_enabled"):
+            lines.extend(
+                [
+                    f"**Maint Margin Rate:** {result['maintenance_margin_rate'] * 100:.3f}%",
+                    f"**Roundtrip Fees:** {result['fee_roundtrip_bps']:.2f} bps",
+                ]
+            )
+            if result.get("estimated_liquidation_price") is not None:
+                lines.append(f"**Est. Liquidation:** ${result['estimated_liquidation_price']:,.2f}")
+            if result.get("distance_to_liquidation_pct") is not None:
+                lines.append(f"**Distance to Liq:** {result['distance_to_liquidation_pct'] * 100:.3f}%")
+            if result.get("stop_within_liquidation_buffer") is not None:
+                lines.append(f"**Stop Within Liq Buffer:** {result['stop_within_liquidation_buffer']}")
         for w in result.get("warnings", []):
             lines.append(w)
 
@@ -2909,6 +3094,16 @@ class BTCProbabilityAlertApp:
             "min_signal_strength": result["min_signal_strength"],
             "take_profit_mult": result["take_profit_mult"],
             "stop_loss_mult": result["stop_loss_mult"],
+            "contract_check_enabled": result.get("contract_check_enabled"),
+            "maintenance_margin_rate": result.get("maintenance_margin_rate"),
+            "fee_roundtrip_bps": result.get("fee_roundtrip_bps"),
+            "estimated_liquidation_price": result.get("estimated_liquidation_price"),
+            "distance_to_liquidation_pct": result.get("distance_to_liquidation_pct"),
+            "take_profit_unlevered_pct": result.get("take_profit_unlevered_pct"),
+            "stop_loss_unlevered_pct": result.get("stop_loss_unlevered_pct"),
+            "take_profit_pnl_pct_levered_net": result.get("take_profit_pnl_pct_levered_net"),
+            "stop_loss_pnl_pct_levered_net": result.get("stop_loss_pnl_pct_levered_net"),
+            "stop_within_liquidation_buffer": result.get("stop_within_liquidation_buffer"),
             "realized_volatility": result["realized_volatility"],
             "expected_move": result["expected_move"],
             "resolution_due_utc": result["resolution_due_utc"],
@@ -2928,6 +3123,215 @@ class BTCProbabilityAlertApp:
                 writer.writerow(row)
         except Exception as exc:
             print(f"Warning: failed writing futures log: {exc}")
+
+    def _safe_read_futures_log(self) -> pd.DataFrame:
+        if not self.futures_log_path.exists():
+            return pd.DataFrame()
+        try:
+            return pd.read_csv(self.futures_log_path)
+        except Exception:
+            try:
+                df = pd.read_csv(self.futures_log_path, on_bad_lines="skip", engine="python")
+                print("Warning: futures_query_log had malformed rows; skipped bad lines while reading.")
+                return df
+            except Exception as exc:
+                print(f"Warning: failed reading futures_query_log: {exc}")
+                return pd.DataFrame()
+
+    def _resolve_past_futures_queries(self) -> None:
+        if not self.futures_log_path.exists():
+            return
+
+        df = self._safe_read_futures_log()
+        if df.empty:
+            return
+
+        needed = [
+            "resolved",
+            "resolved_price",
+            "settled_at_utc",
+            "realized_return_unlevered",
+            "realized_pnl_pct_levered_net",
+            "realized_direction_up",
+            "trade_won",
+        ]
+        for c in needed:
+            if c not in df.columns:
+                df[c] = None
+
+        changed = False
+        now = datetime.now(timezone.utc)
+        for idx, row in df.iterrows():
+            resolved = str(row.get("resolved", "")).strip().lower() in {"1", "true", "yes"}
+            due_raw = row.get("resolution_due_utc")
+            if pd.isna(due_raw):
+                continue
+            try:
+                due = datetime.fromisoformat(str(due_raw))
+                if due.tzinfo is None:
+                    due = due.replace(tzinfo=timezone.utc)
+            except Exception:
+                continue
+            if due > now:
+                continue
+
+            resolved_price_exists = pd.notna(pd.to_numeric(pd.Series([row.get("resolved_price")]), errors="coerce").iloc[0])
+            if resolved and resolved_price_exists:
+                continue
+
+            signal = str(row.get("signal", "NO_TRADE")).strip().upper()
+            entry = float(pd.to_numeric(pd.Series([row.get("entry_price")]), errors="coerce").fillna(row.get("spot_price")).iloc[0])
+            lev = float(pd.to_numeric(pd.Series([row.get("leverage")]), errors="coerce").fillna(1.0).iloc[0])
+            fee_bps = float(pd.to_numeric(pd.Series([row.get("fee_roundtrip_bps")]), errors="coerce").fillna(0.0).iloc[0])
+
+            if (not np.isfinite(entry)) or entry <= 0:
+                continue
+
+            try:
+                realized_px = float(self._price_at_or_after(due))
+            except Exception:
+                continue
+
+            is_up = 1 if realized_px >= entry else 0
+            if signal == "LONG":
+                unlev = float((realized_px - entry) / max(entry, EPS))
+            elif signal == "SHORT":
+                unlev = float((entry - realized_px) / max(entry, EPS))
+            else:
+                unlev = 0.0
+
+            lev_net = float(unlev * max(lev, 0.0) - (fee_bps / 10000.0 if signal in {"LONG", "SHORT"} else 0.0))
+            won = None
+            if signal in {"LONG", "SHORT"}:
+                won = int(lev_net > 0.0)
+
+            df.loc[idx, "resolved"] = True
+            df.loc[idx, "resolved_price"] = float(realized_px)
+            df.loc[idx, "settled_at_utc"] = now.isoformat()
+            df.loc[idx, "realized_return_unlevered"] = float(unlev)
+            df.loc[idx, "realized_pnl_pct_levered_net"] = float(lev_net)
+            df.loc[idx, "realized_direction_up"] = int(is_up)
+            df.loc[idx, "trade_won"] = won
+            changed = True
+
+        if changed:
+            df.to_csv(self.futures_log_path, index=False)
+
+    def run_futures_backtest(
+        self,
+        min_confidence: float = 0.0,
+        min_signal_strength: float = 0.0,
+        include_no_trade: bool = False,
+    ) -> Dict[str, Any]:
+        self._resolve_past_futures_queries()
+        df = self._safe_read_futures_log()
+        if df.empty:
+            out = {
+                "status": "empty",
+                "message": "No futures log rows found. Run --mode futures first.",
+            }
+            print(json.dumps(out, indent=2))
+            return out
+
+        for c in [
+            "confidence_score",
+            "signal_strength",
+            "realized_pnl_pct_levered_net",
+            "realized_direction_up",
+            "prob_up",
+            "resolved",
+        ]:
+            if c not in df.columns:
+                df[c] = np.nan
+
+        df["signal"] = df.get("signal", "").astype(str).str.upper()
+        df["resolved_bool"] = df["resolved"].astype(str).str.lower().isin(["1", "true", "yes"])
+        df["confidence_score"] = pd.to_numeric(df["confidence_score"], errors="coerce")
+        df["signal_strength"] = pd.to_numeric(df["signal_strength"], errors="coerce")
+        df["realized_pnl_pct_levered_net"] = pd.to_numeric(df["realized_pnl_pct_levered_net"], errors="coerce")
+        df["realized_direction_up"] = pd.to_numeric(df["realized_direction_up"], errors="coerce")
+        df["prob_up"] = pd.to_numeric(df["prob_up"], errors="coerce")
+
+        mask = df["resolved_bool"]
+        if not include_no_trade:
+            mask &= df["signal"].isin(["LONG", "SHORT"])
+        mask &= df["confidence_score"].fillna(0.0) >= float(min_confidence)
+        mask &= df["signal_strength"].abs().fillna(0.0) >= float(min_signal_strength)
+
+        scored = df[mask].copy()
+        scored = scored.dropna(subset=["realized_pnl_pct_levered_net"])
+        if scored.empty:
+            out = {
+                "status": "no_scored_rows",
+                "message": "No resolved rows met filters yet.",
+                "resolved_rows_total": int(df["resolved_bool"].sum()),
+            }
+            print(json.dumps(out, indent=2))
+            return out
+
+        pnl = scored["realized_pnl_pct_levered_net"].to_numpy(dtype=float)
+        trades = scored[scored["signal"].isin(["LONG", "SHORT"])].copy()
+        wins = int((trades["realized_pnl_pct_levered_net"] > 0).sum()) if not trades.empty else 0
+        losses = int((trades["realized_pnl_pct_levered_net"] < 0).sum()) if not trades.empty else 0
+        trade_count = int(len(trades))
+        win_rate = float(wins / trade_count) if trade_count > 0 else None
+
+        gross_profit = float(trades.loc[trades["realized_pnl_pct_levered_net"] > 0, "realized_pnl_pct_levered_net"].sum()) if not trades.empty else 0.0
+        gross_loss = float(-trades.loc[trades["realized_pnl_pct_levered_net"] < 0, "realized_pnl_pct_levered_net"].sum()) if not trades.empty else 0.0
+        profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else None
+
+        # Directional accuracy conditioned on executed signal.
+        directional_acc = None
+        if not trades.empty and "realized_direction_up" in trades.columns:
+            pred_up = (trades["signal"] == "LONG").astype(int)
+            actual_up = pd.to_numeric(trades["realized_direction_up"], errors="coerce")
+            m = actual_up.notna()
+            if bool(m.any()):
+                directional_acc = float(np.mean(pred_up[m].to_numpy(dtype=int) == actual_up[m].to_numpy(dtype=int)))
+
+        summary = {
+            "status": "ok",
+            "rows_total": int(len(df)),
+            "rows_resolved": int(df["resolved_bool"].sum()),
+            "rows_scored": int(len(scored)),
+            "trade_count": trade_count,
+            "filters": {
+                "min_confidence": float(min_confidence),
+                "min_signal_strength": float(min_signal_strength),
+                "include_no_trade": bool(include_no_trade),
+            },
+            "win_rate": win_rate,
+            "directional_accuracy": directional_acc,
+            "avg_pnl_pct_levered_net": float(np.mean(pnl)),
+            "median_pnl_pct_levered_net": float(np.median(pnl)),
+            "total_pnl_pct_levered_net": float(np.sum(pnl)),
+            "gross_profit_pct": gross_profit,
+            "gross_loss_pct": gross_loss,
+            "profit_factor": profit_factor,
+            "plus_ev_by_realized_mean": bool(float(np.mean(pnl)) > 0.0),
+        }
+
+        out_path = self.latest_dir / "futures_backtest_report.json"
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+
+        print("\nFutures Backtest Summary")
+        print("------------------------")
+        print(f"Rows Total / Resolved / Scored: {summary['rows_total']} / {summary['rows_resolved']} / {summary['rows_scored']}")
+        print(f"Trade Count: {summary['trade_count']}")
+        print(f"Win Rate: {('%.2f%%' % (100.0 * summary['win_rate'])) if summary['win_rate'] is not None else 'n/a'}")
+        print(
+            f"Directional Accuracy: "
+            f"{('%.2f%%' % (100.0 * summary['directional_accuracy'])) if summary['directional_accuracy'] is not None else 'n/a'}"
+        )
+        print(f"Avg PnL (levered, net fees): {summary['avg_pnl_pct_levered_net'] * 100:.3f}%")
+        print(f"Median PnL (levered, net fees): {summary['median_pnl_pct_levered_net'] * 100:.3f}%")
+        print(f"Total PnL (levered, net fees): {summary['total_pnl_pct_levered_net'] * 100:.3f}%")
+        print(f"Profit Factor: {summary['profit_factor'] if summary['profit_factor'] is not None else 'n/a'}")
+        print(f"Plus EV (realized mean > 0): {summary['plus_ev_by_realized_mean']}")
+        print(f"Saved report: {out_path}")
+
+        return summary
 
     @staticmethod
     def _contract_id(target_price: float, resolution_due_utc: str) -> str:
@@ -3179,9 +3583,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="BTC target probability + edge + Discord alert")
     parser.add_argument(
         "--mode",
-        choices=["manual", "auto", "futures"],
+        choices=["manual", "auto", "futures", "futures_backtest"],
         default="manual",
-        help="manual = single run, auto = continuous strike scan, futures = directional signal",
+        help="manual = single run, auto = continuous strike scan, futures = directional signal, futures_backtest = score resolved futures logs",
     )
     parser.add_argument("--interactive", action="store_true", help="Prompt for numeric inputs")
     parser.add_argument("--target", required=False, type=float, help="Target BTC price in USD")
@@ -3208,6 +3612,27 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--min-signal-strength", default=0.40, type=float, help="Futures mode minimum signal strength")
     parser.add_argument("--take-profit-mult", default=1.20, type=float, help="Futures mode take-profit multiplier")
     parser.add_argument("--stop-loss-mult", default=0.70, type=float, help="Futures mode stop-loss multiplier")
+    parser.add_argument("--contract-check", action="store_true", help="Futures mode: include liquidation-buffer and fee-aware contract risk checks")
+    parser.add_argument(
+        "--maintenance-margin-rate",
+        default=0.005,
+        type=float,
+        help="Futures mode contract check: maintenance margin rate as fraction (default 0.005 = 0.5%%)",
+    )
+    parser.add_argument(
+        "--taker-fee-bps",
+        default=5.0,
+        type=float,
+        help="Futures mode contract check: taker fee per side in bps (roundtrip is 2x)",
+    )
+    parser.add_argument("--backtest-min-confidence", default=0.0, type=float, help="Futures backtest: minimum confidence score filter")
+    parser.add_argument(
+        "--backtest-min-signal-strength",
+        default=0.0,
+        type=float,
+        help="Futures backtest: minimum absolute signal strength filter",
+    )
+    parser.add_argument("--backtest-include-no-trade", action="store_true", help="Futures backtest: include NO_TRADE rows in scored set")
     return parser
 
 
@@ -3276,7 +3701,18 @@ def main() -> None:
             min_signal_strength=args.min_signal_strength,
             take_profit_mult=args.take_profit_mult,
             stop_loss_mult=args.stop_loss_mult,
+            contract_check=args.contract_check,
+            maintenance_margin_rate=args.maintenance_margin_rate,
+            taker_fee_bps=args.taker_fee_bps,
             plot=args.plot,
+        )
+        return
+
+    if args.mode == "futures_backtest":
+        app.run_futures_backtest(
+            min_confidence=float(args.backtest_min_confidence),
+            min_signal_strength=float(args.backtest_min_signal_strength),
+            include_no_trade=bool(args.backtest_include_no_trade),
         )
         return
 

@@ -25,11 +25,13 @@ cp .env.example .env
 - `ALERT_WEBHOOK_URL` (Discord webhook)
 - `KALSHI_API_KEY` / `KALSHI_API_TOKEN` / `KALSHI_API_BASE` (for live market scan)
 - `CALIBRATOR_ARTIFACT_PATH` (optional override; default artifact path is used if omitted)
-- `FUTURES_EXCHANGE` (optional: `binance`, `bybit`, `okx` to augment futures features)
+- `FUTURES_EXCHANGE` (optional: `binance`, `bybit`, `okx`, `bydfi` to augment futures features)
 - `FUTURES_OVERRIDE_FEATURES` (default: `true` to override funding/OI/liquidation/orderbook with futures data)
 - `BINANCE_FUTURES_SYMBOL` (default: `BTCUSDT`)
 - `BYBIT_FUTURES_SYMBOL` (default: `BTCUSDT`)
 - `OKX_FUTURES_SYMBOL` (default: `BTC-USDT-SWAP`)
+- `BYDFI_FUTURES_BASE` (default: `https://open-api.bydoxe.com`)
+- `BYDFI_FUTURES_SYMBOL` (default: `BTCUSDT`)
 
 ## Modes
 
