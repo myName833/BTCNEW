@@ -283,9 +283,10 @@ class BTCProbabilityAlertApp:
         self,
         timeframe_minutes: int,
         leverage: float = 10.0,
-        expected_return_threshold: float = 0.0015,
-        min_confidence: float = 0.60,
-        min_signal_strength: float = 0.40,
+        expected_return_threshold: float = 0.0005,
+        min_confidence: float = 0.52,
+        min_signal_strength: float = 0.10,
+        prob_threshold: float = 0.55,
         take_profit_mult: float = 1.20,
         stop_loss_mult: float = 0.70,
         contract_check: bool = False,
@@ -301,6 +302,8 @@ class BTCProbabilityAlertApp:
             raise ValueError("expected_return_threshold must be >= 0")
         if not (0.0 <= min_confidence <= 1.0):
             raise ValueError("min_confidence must be in [0, 1]")
+        if not (0.0 < prob_threshold < 1.0):
+            raise ValueError("prob_threshold must be in (0, 1)")
         if min_signal_strength < 0:
             raise ValueError("min_signal_strength must be >= 0")
         if take_profit_mult <= 0 or stop_loss_mult <= 0:
@@ -316,6 +319,7 @@ class BTCProbabilityAlertApp:
             expected_return_threshold=expected_return_threshold,
             min_confidence=min_confidence,
             min_signal_strength=min_signal_strength,
+            prob_threshold=prob_threshold,
             take_profit_mult=take_profit_mult,
             stop_loss_mult=stop_loss_mult,
             contract_check=contract_check,
@@ -854,6 +858,7 @@ class BTCProbabilityAlertApp:
         expected_return_threshold: float,
         min_confidence: float,
         min_signal_strength: float,
+        prob_threshold: float,
         take_profit_mult: float,
         stop_loss_mult: float,
         contract_check: bool,
@@ -901,15 +906,24 @@ class BTCProbabilityAlertApp:
         confidence_score = float(confidence_meta["confidence_score"])
 
         direction = "NO_TRADE"
-        if expected_return > expected_return_threshold and confidence_score >= min_confidence and abs(signal_strength) >= min_signal_strength:
+        if (
+            prob_up >= prob_threshold
+            and expected_return > expected_return_threshold
+            and abs(signal_strength) >= min_signal_strength
+        ):
             direction = "LONG"
-        elif expected_return < -expected_return_threshold and confidence_score >= min_confidence and abs(signal_strength) >= min_signal_strength:
+        elif (
+            prob_up <= (1.0 - prob_threshold)
+            and expected_return < -expected_return_threshold
+            and abs(signal_strength) >= min_signal_strength
+        ):
             direction = "SHORT"
 
         vol_pct = float(np.clip(realized_volatility, 1e-6, 1.0))
         abs_ret = float(abs(expected_return))
-        take_profit_pct = float(max(abs_ret * take_profit_mult, vol_pct * 0.60))
-        stop_loss_pct = float(max(abs_ret * stop_loss_mult, vol_pct * 0.40))
+        edge_move = float(max(abs_ret, vol_pct * 0.50))
+        take_profit_pct = float(max(edge_move * take_profit_mult, vol_pct * 0.35))
+        stop_loss_pct = float(max(edge_move * stop_loss_mult, vol_pct * 0.25))
 
         entry_price = float(spot)
         if direction == "LONG":
@@ -990,6 +1004,7 @@ class BTCProbabilityAlertApp:
             "expected_return_threshold": float(expected_return_threshold),
             "min_confidence": float(min_confidence),
             "min_signal_strength": float(min_signal_strength),
+            "prob_threshold": float(prob_threshold),
             "take_profit_mult": float(take_profit_mult),
             "stop_loss_mult": float(stop_loss_mult),
             "contract_check_enabled": bool(contract_check),
@@ -3607,9 +3622,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-expiry-minutes", default=180.0, type=float, help="Auto mode: maximum minutes to expiry")
     parser.add_argument("--max-cycles", default=None, type=int, help="Auto mode max cycles before stopping")
     parser.add_argument("--leverage", default=10.0, type=float, help="Futures mode leverage (x)")
-    parser.add_argument("--return-threshold", default=0.0015, type=float, help="Futures mode expected return threshold")
-    parser.add_argument("--min-confidence", default=0.60, type=float, help="Futures mode minimum confidence score")
-    parser.add_argument("--min-signal-strength", default=0.40, type=float, help="Futures mode minimum signal strength")
+    parser.add_argument("--return-threshold", default=0.0005, type=float, help="Futures mode expected return threshold")
+    parser.add_argument("--min-confidence", default=0.52, type=float, help="Futures mode minimum confidence score")
+    parser.add_argument("--min-signal-strength", default=0.10, type=float, help="Futures mode minimum signal strength")
+    parser.add_argument("--prob-threshold", default=0.55, type=float, help="Futures mode probability threshold for long/short")
     parser.add_argument("--take-profit-mult", default=1.20, type=float, help="Futures mode take-profit multiplier")
     parser.add_argument("--stop-loss-mult", default=0.70, type=float, help="Futures mode stop-loss multiplier")
     parser.add_argument("--contract-check", action="store_true", help="Futures mode: include liquidation-buffer and fee-aware contract risk checks")
@@ -3639,8 +3655,9 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> None:
     base_dir = Path(__file__).resolve().parent
     if load_dotenv is not None:
-        load_dotenv(base_dir / ".env")
-        load_dotenv(base_dir.parent / "BTC" / ".env")
+        # Prefer BTCNEW/.env, then repo root .env
+        load_dotenv(base_dir.parent / ".env")
+        load_dotenv(base_dir.parent.parent / ".env")
 
     args = build_parser().parse_args()
     app = BTCProbabilityAlertApp(base_dir)
@@ -3699,6 +3716,7 @@ def main() -> None:
             expected_return_threshold=args.return_threshold,
             min_confidence=args.min_confidence,
             min_signal_strength=args.min_signal_strength,
+            prob_threshold=args.prob_threshold,
             take_profit_mult=args.take_profit_mult,
             stop_loss_mult=args.stop_loss_mult,
             contract_check=args.contract_check,

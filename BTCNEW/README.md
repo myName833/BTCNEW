@@ -165,6 +165,34 @@ Guardrail tuning flags are available:
 - Optional chart PNGs: `artifacts/charts/`
 - Resolved outcome updates are written back into query log for calibration
 
+## Quant Research Pipeline (Institutional)
+
+New modular research pipeline lives in `BTCNEW/quant_pipeline/`:
+
+Scripts:
+- `data_fetcher.py`
+- `feature_engineering.py`
+- `dataset_builder.py`
+- `feature_selection.py`
+- `train_model.py`
+- `probability_calibration.py`
+- `regime_detection.py`
+- `backtest_engine.py`
+- `performance_metrics.py`
+- `walkforward_test.py`
+- `monte_carlo.py`
+
+Example workflow:
+
+```bash
+python BTCNEW/quant_pipeline/dataset_builder.py --start 2026-01-01 --end 2026-03-11 --candle-minutes 5
+python BTCNEW/quant_pipeline/train_model.py --dataset BTCNEW/artifacts/data/dataset_BTC-USD_2026-01-01_2026-03-11_5m.csv --target target_cls_30m --task clf
+python BTCNEW/quant_pipeline/probability_calibration.py --dataset BTCNEW/artifacts/data/dataset_BTC-USD_2026-01-01_2026-03-11_5m.csv --model BTCNEW/artifacts/models/target_cls_30m_lightgbm.joblib --target target_cls_30m
+python BTCNEW/quant_pipeline/backtest_engine.py --dataset BTCNEW/artifacts/data/dataset_BTC-USD_2026-01-01_2026-03-11_5m.csv --model BTCNEW/artifacts/models/target_cls_30m_lightgbm.joblib --horizon 30 --candle-minutes 5
+python BTCNEW/quant_pipeline/performance_metrics.py --trades BTCNEW/artifacts/backtest/backtest_trades.csv
+python BTCNEW/quant_pipeline/monte_carlo.py --trades BTCNEW/artifacts/backtest/backtest_trades.csv
+```
+
 ## Python API
 
 ```python
