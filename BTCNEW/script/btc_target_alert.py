@@ -60,6 +60,14 @@ class BTCProbabilityAlertApp:
         self._calibrator: object = {"method": "none", "model": None}
         self._calibrator_source: str = "none"
         self._calibrator_ready = False
+        self._futures_model_ready = False
+        self._futures_model: object = None
+        self._futures_model_source: str = "none"
+        self._futures_model_features: List[str] = []
+        self._futures_calibrated_model: object = None
+        self._futures_calibrated_model_source: str = "none"
+        self._futures_calibrator: object = {"method": "none", "model": None}
+        self._futures_calibrator_source: str = "none"
 
     def run(
         self,
@@ -287,6 +295,8 @@ class BTCProbabilityAlertApp:
         min_confidence: float = 0.52,
         min_signal_strength: float = 0.10,
         prob_threshold: float = 0.55,
+        prob_long_threshold: Optional[float] = None,
+        prob_short_threshold: Optional[float] = None,
         take_profit_mult: float = 1.20,
         stop_loss_mult: float = 0.70,
         contract_check: bool = False,
@@ -304,6 +314,10 @@ class BTCProbabilityAlertApp:
             raise ValueError("min_confidence must be in [0, 1]")
         if not (0.0 < prob_threshold < 1.0):
             raise ValueError("prob_threshold must be in (0, 1)")
+        if prob_long_threshold is not None and not (0.5 < prob_long_threshold < 1.0):
+            raise ValueError("prob_long_threshold must be in (0.5, 1.0)")
+        if prob_short_threshold is not None and not (0.0 < prob_short_threshold < 0.5):
+            raise ValueError("prob_short_threshold must be in (0.0, 0.5)")
         if min_signal_strength < 0:
             raise ValueError("min_signal_strength must be >= 0")
         if take_profit_mult <= 0 or stop_loss_mult <= 0:
@@ -320,6 +334,8 @@ class BTCProbabilityAlertApp:
             min_confidence=min_confidence,
             min_signal_strength=min_signal_strength,
             prob_threshold=prob_threshold,
+            prob_long_threshold=prob_long_threshold,
+            prob_short_threshold=prob_short_threshold,
             take_profit_mult=take_profit_mult,
             stop_loss_mult=stop_loss_mult,
             contract_check=contract_check,
@@ -859,6 +875,8 @@ class BTCProbabilityAlertApp:
         min_confidence: float,
         min_signal_strength: float,
         prob_threshold: float,
+        prob_long_threshold: Optional[float],
+        prob_short_threshold: Optional[float],
         take_profit_mult: float,
         stop_loss_mult: float,
         contract_check: bool,
@@ -867,57 +885,43 @@ class BTCProbabilityAlertApp:
     ) -> Dict[str, Any]:
         warnings: List[str] = []
         now_utc = datetime.now(timezone.utc)
-        self._ensure_calibrator_loaded(warnings)
-
         spot = self._fetch_spot_price(warnings)
         factors = self._collect_factors(timeframe_minutes, warnings)
         spot, factors = self._sanitize_market_inputs(spot, factors, warnings)
+        self._ensure_futures_model_loaded(warnings)
+        factors = self._augment_futures_factors(spot, timeframe_minutes, factors)
 
         annual_vol = max(float(factors.get("realized_vol_annual", 0.55)), 0.08)
         t_years = max(timeframe_minutes, 1) / (365.0 * 24.0 * 60.0)
-        sigma = max(annual_vol * math.sqrt(t_years), 1e-6)
-        expected_move = max(spot * sigma, EPS)
+        realized_volatility = max(float(annual_vol * math.sqrt(t_years)), 1e-6)
+        expected_move = max(spot * realized_volatility, EPS)
 
-        factors["distance_vol_normalized_signed"] = 0.0
-        factors["distance_vol_normalized_abs"] = 0.0
-        factors["minutes_remaining"] = float(max(timeframe_minutes, 1))
-        factors["sqrt_time_remaining"] = float(math.sqrt(max(timeframe_minutes, 1)))
-        factors["minutes_remaining_scaled"] = float(min(max(timeframe_minutes, 1) / 60.0, 1.0))
-        factors["time_adjusted_distance"] = 0.0
-
-        prob_up_raw, model_meta = self._model_probability(
-            spot, spot, timeframe_minutes, annual_vol, "above", factors, return_details=True
-        )
-        prob_up = float(self.apply_calibrator(self._calibrator, np.array([prob_up_raw], dtype=float))[0])
+        futures_inference = self._run_futures_model_inference(spot=spot, factors=factors, warnings=warnings)
+        raw_prob_up = float(futures_inference["raw_probability"])
+        prob_up = float(futures_inference["calibrated_probability"])
         prob_down = float(np.clip(1.0 - prob_up, 0.01, 0.99))
-
-        expected_final_price = float(model_meta.get("expected_final_price", spot))
-        expected_return = float((expected_final_price - spot) / max(spot, EPS))
-        realized_volatility = float(sigma)
-        signal_strength = float(expected_return / (realized_volatility + EPS))
-
-        confidence_meta = self._confidence_reliability(
-            model_prob_yes=prob_up,
-            distance_vol_normalized=signal_strength,
-            model_meta=model_meta,
-            factors=factors,
-            warnings=warnings,
+        signed_edge = float(np.clip((prob_up - 0.5) * 2.0, -1.0, 1.0))
+        confidence_score = float(abs(signed_edge))
+        signal_strength = float(signed_edge)
+        expected_return = float(signed_edge * realized_volatility)
+        expected_final_price = float(max(spot * (1.0 + expected_return), EPS))
+        thresholds = self._resolve_futures_thresholds(
+            prob_threshold=prob_threshold,
+            prob_long_threshold=prob_long_threshold,
+            prob_short_threshold=prob_short_threshold,
         )
-        confidence_score = float(confidence_meta["confidence_score"])
-
-        direction = "NO_TRADE"
-        if (
-            prob_up >= prob_threshold
-            and expected_return > expected_return_threshold
-            and abs(signal_strength) >= min_signal_strength
-        ):
-            direction = "LONG"
-        elif (
-            prob_up <= (1.0 - prob_threshold)
-            and expected_return < -expected_return_threshold
-            and abs(signal_strength) >= min_signal_strength
-        ):
-            direction = "SHORT"
+        decision = self._decide_futures_signal(
+            prob_up=prob_up,
+            expected_return=expected_return,
+            confidence_score=confidence_score,
+            signal_strength=signal_strength,
+            expected_return_threshold=expected_return_threshold,
+            min_confidence=min_confidence,
+            min_signal_strength=min_signal_strength,
+            long_threshold=thresholds["long_threshold"],
+            short_threshold=thresholds["short_threshold"],
+        )
+        direction = str(decision["signal"])
 
         vol_pct = float(np.clip(realized_volatility, 1e-6, 1.0))
         abs_ret = float(abs(expected_return))
@@ -983,6 +987,13 @@ class BTCProbabilityAlertApp:
         if contract_check and stop_within_liquidation_buffer is False:
             warnings.append("Configured stop-loss is beyond estimated liquidation price.")
 
+        diagnostics = self._futures_live_diagnostics(
+            raw_probability=raw_prob_up,
+            calibrated_probability=prob_up,
+            signal=direction,
+            warnings=warnings,
+        )
+
         result = {
             "mode": "futures",
             "timestamp_utc": now_utc.isoformat(),
@@ -992,10 +1003,18 @@ class BTCProbabilityAlertApp:
             "target_price": float(expected_final_price),
             "expected_return": float(expected_return),
             "expected_price": float(expected_final_price),
+            "raw_model_score": float(futures_inference["raw_score"]),
+            "raw_model_probability": float(raw_prob_up),
+            "calibrated_probability": float(prob_up),
             "prob_up": float(prob_up),
             "prob_down": float(prob_down),
             "confidence_score": float(confidence_score),
             "signal": direction,
+            "signal_side": direction,
+            "no_trade_reason": str(decision["no_trade_reason"]),
+            "threshold_used": decision["threshold_used"],
+            "long_threshold": float(thresholds["long_threshold"]),
+            "short_threshold": float(thresholds["short_threshold"]),
             "entry_price": float(entry_price),
             "take_profit": take_profit,
             "stop_loss": stop_loss,
@@ -1019,10 +1038,20 @@ class BTCProbabilityAlertApp:
             "stop_within_liquidation_buffer": stop_within_liquidation_buffer,
             "realized_volatility": float(realized_volatility),
             "expected_move": float(expected_move),
-            "confidence_components": confidence_meta,
+            "model_artifact_path": self._futures_model_source,
+            "model_type": type(self._futures_model).__name__ if self._futures_model is not None else "none",
+            "calibrated_model_artifact_path": self._futures_calibrated_model_source,
+            "calibration_method": str(futures_inference["calibration_method"]),
+            "calibration_source": str(futures_inference["calibration_source"]),
+            "feature_count": int(len(self._futures_model_features)),
+            "feature_names": list(self._futures_model_features),
+            "feature_values": futures_inference["feature_values"],
+            "live_diagnostics": diagnostics,
             "factors": factors,
             "warnings": warnings,
             "resolution_due_utc": (now_utc + timedelta(minutes=timeframe_minutes)).isoformat(),
+            "resolved": False,
+            "resolved_price": None,
         }
         return result
 
@@ -1392,6 +1421,436 @@ class BTCProbabilityAlertApp:
         warnings.append("No calibrator artifact found; using raw model probability")
         self._calibrator = {"method": "none", "model": None}
         self._calibrator_source = "none"
+
+    @staticmethod
+    def _artifact_stem_without_calibration_suffix(path: Path) -> str:
+        stem = path.stem
+        for suffix in ["_calibrated_isotonic", "_calibrated_platt", "_calibrated", "_calibrator"]:
+            if stem.endswith(suffix):
+                return stem[: -len(suffix)]
+        return stem
+
+    def _candidate_futures_model_paths(self) -> List[Path]:
+        env_path = os.getenv("FUTURES_MODEL_ARTIFACT_PATH", "").strip()
+        cands: List[Path] = []
+        if env_path:
+            cands.append(Path(env_path))
+        cands.extend(
+            [
+                self.base_dir / "artifacts" / "models" / "futures_target_cls_30m_rf.joblib",
+                self.base_dir / "artifacts" / "models" / "futures_target_cls_30m_logreg.joblib",
+                self.base_dir / "artifacts" / "models" / "futures_model.joblib",
+                self.base_dir / "artifacts" / "models" / "target_cls_30m_rf.joblib",
+                self.base_dir / "artifacts" / "models" / "target_cls_30m_logreg.joblib",
+            ]
+        )
+        return cands
+
+    def _candidate_futures_calibrated_model_paths(self) -> List[Path]:
+        env_path = os.getenv("FUTURES_CALIBRATED_MODEL_PATH", "").strip()
+        cands: List[Path] = []
+        if env_path:
+            cands.append(Path(env_path))
+        cands.extend(
+            [
+                self.base_dir / "artifacts" / "models" / "futures_target_cls_30m_rf_calibrated_isotonic.joblib",
+                self.base_dir / "artifacts" / "models" / "futures_target_cls_30m_rf_calibrated_platt.joblib",
+                self.base_dir / "artifacts" / "models" / "futures_calibrated.joblib",
+                self.base_dir / "artifacts" / "models" / "target_cls_30m_rf_calibrated_isotonic.joblib",
+                self.base_dir / "artifacts" / "models" / "target_cls_30m_rf_calibrated_platt.joblib",
+                self.base_dir / "artifacts" / "models" / "calibrated.joblib",
+            ]
+        )
+        return cands
+
+    def _candidate_futures_calibrator_paths(self) -> List[Path]:
+        env_path = os.getenv("FUTURES_CALIBRATOR_ARTIFACT_PATH", "").strip()
+        cands: List[Path] = []
+        if env_path:
+            cands.append(Path(env_path))
+        cands.extend(
+            [
+                self.base_dir / "artifacts" / "models" / "futures_calibrator.joblib",
+                self.base_dir / "artifacts" / "models" / "futures_target_cls_30m_calibrator.joblib",
+            ]
+        )
+        return cands
+
+    def _feature_metadata_paths_for_model(self, model_path: Path) -> List[Path]:
+        env_path = os.getenv("FUTURES_FEATURES_PATH", "").strip()
+        cands: List[Path] = []
+        if env_path:
+            cands.append(Path(env_path))
+        stem = self._artifact_stem_without_calibration_suffix(model_path)
+        cands.extend(
+            [
+                model_path.with_name(f"{model_path.stem}_features.json"),
+                model_path.with_name(f"{stem}_features.json"),
+                self.base_dir / "artifacts" / "models" / "futures_target_cls_30m_features.json",
+                self.base_dir / "artifacts" / "models" / "target_cls_30m_features.json",
+            ]
+        )
+        return cands
+
+    def _load_feature_names_for_model(self, model_path: Path, obj: object, warnings: List[str]) -> List[str]:
+        if isinstance(obj, dict):
+            features = obj.get("features")
+            if isinstance(features, list) and features:
+                return [str(x) for x in features]
+        for path in self._feature_metadata_paths_for_model(model_path):
+            try:
+                if not path.exists():
+                    continue
+                payload = json.loads(path.read_text(encoding="utf-8"))
+                features = payload.get("features")
+                if isinstance(features, list) and features:
+                    return [str(x) for x in features]
+            except Exception as exc:
+                warnings.append(f"Failed loading futures feature metadata from {path}: {exc}")
+        return []
+
+    def _ensure_futures_model_loaded(self, warnings: List[str]) -> None:
+        if self._futures_model_ready:
+            return
+        self._futures_model_ready = True
+
+        if joblib is None:
+            raise RuntimeError("joblib unavailable; cannot load futures model artifacts")
+
+        for path in self._candidate_futures_model_paths():
+            try:
+                if not path.exists():
+                    continue
+                obj = joblib.load(path)
+                model = obj.get("model") if isinstance(obj, dict) and obj.get("model") is not None else obj
+                if hasattr(model, "predict_proba"):
+                    self._futures_model = model
+                    self._futures_model_source = str(path)
+                    self._futures_model_features = self._load_feature_names_for_model(path, obj, warnings)
+                    break
+            except Exception as exc:
+                warnings.append(f"Failed loading futures model from {path}: {exc}")
+
+        if self._futures_model is None:
+            raise RuntimeError(
+                "No futures model artifact found. Set FUTURES_MODEL_ARTIFACT_PATH to a trained futures classifier in BTCNEW/artifacts/models."
+            )
+        if not self._futures_model_features:
+            raise RuntimeError(
+                "No futures feature metadata found. Add a *_features.json file or set FUTURES_FEATURES_PATH."
+            )
+
+        for path in self._candidate_futures_calibrated_model_paths():
+            try:
+                if not path.exists():
+                    continue
+                obj = joblib.load(path)
+                model = obj.get("model") if isinstance(obj, dict) and obj.get("model") is not None else obj
+                if hasattr(model, "predict_proba"):
+                    self._futures_calibrated_model = model
+                    self._futures_calibrated_model_source = str(path)
+                    break
+            except Exception as exc:
+                warnings.append(f"Failed loading futures calibrated model from {path}: {exc}")
+
+        for path in self._candidate_futures_calibrator_paths():
+            try:
+                if not path.exists():
+                    continue
+                obj = joblib.load(path)
+                if isinstance(obj, dict) and "calibrator" in obj and isinstance(obj["calibrator"], dict):
+                    self._futures_calibrator = obj["calibrator"]
+                    self._futures_calibrator_source = str(path)
+                    break
+                if isinstance(obj, dict) and {"method", "model"}.issubset(set(obj.keys())):
+                    self._futures_calibrator = obj
+                    self._futures_calibrator_source = str(path)
+                    break
+            except Exception as exc:
+                warnings.append(f"Failed loading futures calibrator from {path}: {exc}")
+
+        if "futures" not in self._futures_model_source.lower():
+            warnings.append(
+                "Using fallback classifier artifact that is not explicitly futures-named. Replace with a dedicated futures model via FUTURES_MODEL_ARTIFACT_PATH."
+            )
+        if self._futures_calibrated_model is None and str(self._futures_calibrator.get("method", "none")).lower() == "none":
+            warnings.append(
+                "No futures-specific calibrator artifact found; calibrated probability is falling back to the raw model unless FUTURES_CALIBRATOR_ARTIFACT_PATH or FUTURES_CALIBRATED_MODEL_PATH is provided."
+            )
+        elif self._futures_calibrated_model_source and "futures" not in self._futures_calibrated_model_source.lower():
+            warnings.append(
+                "Using fallback calibrated model artifact that is not explicitly futures-named. Replace with a chronological futures holdout calibrator artifact when available."
+            )
+
+    @staticmethod
+    def _safe_numeric(value: Any, default: float) -> float:
+        try:
+            out = float(value)
+        except Exception:
+            return float(default)
+        if not np.isfinite(out):
+            return float(default)
+        return float(out)
+
+    def _augment_futures_factors(self, spot: float, timeframe_minutes: int, factors: Dict[str, float]) -> Dict[str, float]:
+        out = dict(factors)
+        out["distance_vol_normalized_signed"] = float(out.get("distance_vol_normalized_signed", 0.0))
+        out["distance_vol_normalized_abs"] = float(abs(out.get("distance_vol_normalized_signed", 0.0)))
+        out["minutes_remaining"] = float(max(timeframe_minutes, 1))
+        out["sqrt_time_remaining"] = float(math.sqrt(max(timeframe_minutes, 1)))
+        out["minutes_remaining_scaled"] = float(min(max(timeframe_minutes, 1) / 60.0, 1.0))
+        out["time_adjusted_distance"] = float(abs(out.get("distance_to_vwap", 0.0)) / max(math.sqrt(max(timeframe_minutes, 1)), 1.0))
+        out["close"] = self._safe_numeric(out.get("close"), spot)
+        out["open"] = self._safe_numeric(out.get("open"), out["close"])
+        out["high"] = self._safe_numeric(out.get("high"), max(out["open"], out["close"]))
+        out["low"] = self._safe_numeric(out.get("low"), min(out["open"], out["close"]))
+        out["volume"] = self._safe_numeric(out.get("volume"), self._safe_numeric(out.get("vol_ma_20"), 0.0))
+        out["basis_spread"] = self._safe_numeric(out.get("basis_spread"), out.get("perp_premium", 0.0))
+        out["liquidation_pressure"] = self._safe_numeric(
+            out.get("liquidation_pressure"),
+            out.get("futures_liquidation_pressure", out.get("trade_flow_notional_usd", 0.0)),
+        )
+        out["volume_delta"] = self._safe_numeric(out.get("volume_delta"), out.get("trade_flow_imbalance", 0.0))
+        out["funding_regime"] = self._safe_numeric(out.get("funding_regime"), np.sign(out.get("funding_rate", 0.0)))
+        out["funding_divergence"] = self._safe_numeric(
+            out.get("funding_divergence"),
+            out.get("funding_rate", 0.0) - out.get("perp_premium", 0.0),
+        )
+        out["oi_accel"] = self._safe_numeric(
+            out.get("oi_accel"),
+            out.get("futures_open_interest_change_1m", out.get("open_interest_change", 0.0))
+            - out.get("futures_open_interest_change_5m", out.get("open_interest_change", 0.0)),
+        )
+        out["oi_trend"] = self._safe_numeric(
+            out.get("oi_trend"),
+            out.get("futures_open_interest_change_5m", out.get("open_interest_change", 0.0)),
+        )
+        out["liq_pressure_abs"] = self._safe_numeric(out.get("liq_pressure_abs"), abs(out["liquidation_pressure"]))
+        out["liq_pressure_z"] = self._safe_numeric(
+            out.get("liq_pressure_z"),
+            np.sign(out["liquidation_pressure"]) * min(abs(out["liquidation_pressure"]) / 1e8, 5.0),
+        )
+        out["liq_imbalance_z"] = self._safe_numeric(out.get("liq_imbalance_z"), out.get("liquidation_imbalance", 0.0))
+        out["basis_z"] = self._safe_numeric(out.get("basis_z"), out["basis_spread"] * 100.0)
+        out["perp_premium_z"] = self._safe_numeric(out.get("perp_premium_z"), out.get("perp_premium", 0.0) * 100.0)
+        out["long_short_ratio_z"] = self._safe_numeric(
+            out.get("long_short_ratio_z"),
+            (out.get("long_short_ratio", 1.0) - 1.0) / max(out.get("long_short_ratio", 1.0), 1.0),
+        )
+        out["liquidity_gap"] = self._safe_numeric(out.get("liquidity_gap"), out.get("bid_ask_spread", 0.0))
+        out["mom_vol_adj_15"] = self._safe_numeric(
+            out.get("mom_vol_adj_15"),
+            out.get("ret_15", out.get("return_15m", 0.0)) / max(out.get("realized_vol_30", out.get("realized_vol_annual", 0.55)), 1e-6),
+        )
+        out["mom_vol_adj_60"] = self._safe_numeric(
+            out.get("mom_vol_adj_60"),
+            out.get("ret_60", out.get("return_60m", 0.0)) / max(out.get("realized_vol_60", out.get("realized_vol_annual", 0.55)), 1e-6),
+        )
+        out["rolling_sharpe_60"] = self._safe_numeric(
+            out.get("rolling_sharpe_60"),
+            out.get("ret_60", out.get("return_60m", 0.0)) / max(out.get("realized_vol_60", out.get("realized_vol_annual", 0.55)), 1e-6),
+        )
+        return out
+
+    def _feature_value_for_model(self, feature_name: str, spot: float, factors: Dict[str, float]) -> float:
+        feature_aliases = {
+            "ret_1": factors.get("ret_1", factors.get("return_1m", 0.0)),
+            "ret_5": factors.get("ret_5", factors.get("return_5m", 0.0)),
+            "ret_15": factors.get("ret_15", factors.get("return_15m", 0.0)),
+            "ret_30": factors.get("ret_30", factors.get("return_30m", 0.0)),
+            "ret_60": factors.get("ret_60", factors.get("return_60m", 0.0)),
+            "liquidation_pressure": factors.get("liquidation_pressure", factors.get("futures_liquidation_pressure", 0.0)),
+            "basis_spread": factors.get("basis_spread", factors.get("perp_premium", 0.0)),
+            "volume_delta": factors.get("volume_delta", factors.get("trade_flow_imbalance", 0.0)),
+            "open_interest_change": factors.get("open_interest_change", factors.get("futures_open_interest_change_1m", 0.0)),
+            "liquidation_imbalance": factors.get("liquidation_imbalance", factors.get("futures_liquidation_imbalance", 0.0)),
+            "orderbook_imbalance": factors.get("orderbook_imbalance", factors.get("futures_orderbook_imbalance", 0.0)),
+        }
+        if feature_name in feature_aliases:
+            return self._safe_numeric(feature_aliases[feature_name], 0.0)
+        if feature_name in factors:
+            default = spot if feature_name in {"open", "high", "low", "close"} else 0.0
+            return self._safe_numeric(factors[feature_name], default)
+        if feature_name == "close":
+            return float(spot)
+        if feature_name == "open":
+            return self._safe_numeric(factors.get("open"), spot)
+        if feature_name == "high":
+            return self._safe_numeric(factors.get("high"), spot)
+        if feature_name == "low":
+            return self._safe_numeric(factors.get("low"), spot)
+        if feature_name == "volume":
+            return self._safe_numeric(factors.get("volume"), 0.0)
+        if feature_name == "mom_5_15":
+            return self._safe_numeric(
+                factors.get("mom_5_15"),
+                factors.get("ret_5", factors.get("return_5m", 0.0)) - factors.get("ret_15", factors.get("return_15m", 0.0)),
+            )
+        if feature_name == "mom_15_60":
+            return self._safe_numeric(
+                factors.get("mom_15_60"),
+                factors.get("ret_15", factors.get("return_15m", 0.0)) - factors.get("ret_60", factors.get("return_60m", 0.0)),
+            )
+        return 0.0
+
+    def _build_futures_feature_frame(
+        self,
+        spot: float,
+        factors: Dict[str, float],
+        warnings: List[str],
+    ) -> tuple[pd.DataFrame, Dict[str, float]]:
+        row: Dict[str, float] = {}
+        missing: List[str] = []
+        for feature_name in self._futures_model_features:
+            value = self._feature_value_for_model(feature_name, spot, factors)
+            row[feature_name] = float(value)
+            if feature_name not in factors and feature_name not in {"ret_1", "ret_5", "ret_15", "ret_30", "ret_60", "mom_5_15", "mom_15_60"}:
+                if abs(value) < 1e-12 and feature_name not in {"volume", "funding_rate", "open_interest_change", "liquidation_imbalance"}:
+                    missing.append(feature_name)
+        if missing:
+            preview = ", ".join(missing[:8])
+            warnings.append(
+                f"Futures feature builder defaulted {len(missing)} model features to neutral values. Sample: {preview}"
+            )
+        return pd.DataFrame([row], columns=self._futures_model_features), row
+
+    def _run_futures_model_inference(
+        self,
+        spot: float,
+        factors: Dict[str, float],
+        warnings: List[str],
+    ) -> Dict[str, Any]:
+        if self._futures_model is None:
+            raise RuntimeError("Futures model is not loaded")
+
+        X, feature_values = self._build_futures_feature_frame(spot=spot, factors=factors, warnings=warnings)
+        raw_probability = float(np.clip(self._futures_model.predict_proba(X)[:, 1][0], 1e-6, 1 - 1e-6))
+        if hasattr(self._futures_model, "decision_function"):
+            raw_score = float(np.ravel(self._futures_model.decision_function(X))[0])
+        else:
+            raw_score = float(math.log(raw_probability / max(1.0 - raw_probability, 1e-6)))
+
+        calibrated_probability = raw_probability
+        calibration_method = "none"
+        calibration_source = "raw_model_probability"
+
+        if self._futures_calibrated_model is not None:
+            calibrated_probability = float(np.clip(self._futures_calibrated_model.predict_proba(X)[:, 1][0], 1e-6, 1 - 1e-6))
+            calibration_method = f"embedded_{type(self._futures_calibrated_model).__name__}"
+            calibration_source = self._futures_calibrated_model_source
+        elif isinstance(self._futures_calibrator, dict) and str(self._futures_calibrator.get("method", "none")).lower() != "none":
+            calibrated_probability = float(self.apply_calibrator(self._futures_calibrator, np.array([raw_probability], dtype=float))[0])
+            calibration_method = str(self._futures_calibrator.get("method", "none"))
+            calibration_source = self._futures_calibrator_source
+
+        return {
+            "raw_score": raw_score,
+            "raw_probability": raw_probability,
+            "calibrated_probability": calibrated_probability,
+            "calibration_method": calibration_method,
+            "calibration_source": calibration_source,
+            "feature_values": feature_values,
+        }
+
+    @staticmethod
+    def _resolve_futures_thresholds(
+        prob_threshold: float,
+        prob_long_threshold: Optional[float],
+        prob_short_threshold: Optional[float],
+    ) -> Dict[str, float]:
+        long_threshold = float(prob_long_threshold if prob_long_threshold is not None else prob_threshold)
+        short_threshold = float(prob_short_threshold if prob_short_threshold is not None else 1.0 - prob_threshold)
+        if not (short_threshold < 0.5 < long_threshold):
+            raise ValueError("Futures long/short thresholds must satisfy short_threshold < 0.5 < long_threshold")
+        return {"long_threshold": long_threshold, "short_threshold": short_threshold}
+
+    @staticmethod
+    def _decide_futures_signal(
+        prob_up: float,
+        expected_return: float,
+        confidence_score: float,
+        signal_strength: float,
+        expected_return_threshold: float,
+        min_confidence: float,
+        min_signal_strength: float,
+        long_threshold: float,
+        short_threshold: float,
+    ) -> Dict[str, Any]:
+        reasons: List[str] = []
+        if confidence_score < min_confidence:
+            reasons.append("confidence_below_min_confidence")
+        if abs(signal_strength) < min_signal_strength:
+            reasons.append("signal_strength_below_threshold")
+
+        signal = "NO_TRADE"
+        threshold_used: Any = {"long": float(long_threshold), "short": float(short_threshold)}
+        if prob_up >= long_threshold:
+            threshold_used = float(long_threshold)
+            if expected_return > expected_return_threshold:
+                signal = "LONG"
+            else:
+                reasons.append("expected_return_below_long_threshold")
+        elif prob_up <= short_threshold:
+            threshold_used = float(short_threshold)
+            if expected_return < -expected_return_threshold:
+                signal = "SHORT"
+            else:
+                reasons.append("expected_return_above_short_threshold")
+        else:
+            reasons.append("probability_between_thresholds")
+
+        if reasons:
+            signal = "NO_TRADE"
+        return {
+            "signal": signal,
+            "threshold_used": threshold_used,
+            "no_trade_reason": "|".join(reasons) if reasons else "signal_passed",
+        }
+
+    def _futures_live_diagnostics(
+        self,
+        raw_probability: float,
+        calibrated_probability: float,
+        signal: str,
+        warnings: List[str],
+    ) -> Dict[str, Any]:
+        df = self._safe_read_futures_log()
+        recent = df.tail(200).copy() if not df.empty else pd.DataFrame()
+        diag = {
+            "recent_rows": int(len(recent)),
+            "bucketed_probability_warning": False,
+            "extreme_side_imbalance_warning": False,
+            "calibration_warning": False,
+        }
+        if not recent.empty and "prob_up" in recent.columns:
+            probs = pd.to_numeric(recent["prob_up"], errors="coerce").dropna().round(4).tolist()
+            probs.append(round(float(calibrated_probability), 4))
+            unique_count = len(set(probs))
+            diag["recent_unique_probabilities_4dp"] = int(unique_count)
+            if len(probs) >= 25 and unique_count <= 5:
+                warnings.append("WARNING: Futures probabilities look heavily bucketed. Check the calibrator and feature distribution.")
+                diag["bucketed_probability_warning"] = True
+        cal_gap = abs(float(calibrated_probability) - float(raw_probability))
+        diag["calibration_delta"] = float(cal_gap)
+        if cal_gap >= 0.35:
+            warnings.append("WARNING: Futures calibration delta is unusually large. Calibration may be unstable or broken.")
+            diag["calibration_warning"] = True
+        if not recent.empty and "signal" in recent.columns:
+            signals = recent["signal"].astype(str).str.upper()
+            executed = signals[signals.isin(["LONG", "SHORT"])].tolist()
+            if signal in {"LONG", "SHORT"}:
+                executed.append(signal)
+            if len(executed) >= 30:
+                long_count = sum(1 for side in executed if side == "LONG")
+                short_count = sum(1 for side in executed if side == "SHORT")
+                dominant_ratio = max(long_count, short_count) / max(long_count + short_count, 1)
+                diag["recent_long_count"] = int(long_count)
+                diag["recent_short_count"] = int(short_count)
+                diag["recent_dominant_side_ratio"] = float(dominant_ratio)
+                if dominant_ratio >= 0.85:
+                    warnings.append("WARNING: Futures live signal distribution is extremely imbalanced. Review thresholds, labels, and calibration.")
+                    diag["extreme_side_imbalance_warning"] = True
+        return diag
 
     def _coinbase_headers(self) -> Dict[str, str]:
         headers: Dict[str, str] = {}
@@ -2011,11 +2470,19 @@ class BTCProbabilityAlertApp:
         warnings: List[str],
     ) -> Dict[str, float]:
         out = {
+            "open": 0.0,
+            "high": 0.0,
+            "low": 0.0,
+            "close": 0.0,
+            "volume": 0.0,
             "momentum_1h": 0.0,
             "short_term_return": 0.0,
             "return_1m": 0.0,
             "return_3m": 0.0,
             "return_5m": 0.0,
+            "return_15m": 0.0,
+            "return_30m": 0.0,
+            "return_60m": 0.0,
             "return_10m": 0.0,
             "momentum_acceleration": 0.0,
             "realized_vol_annual": 0.55,
@@ -2023,18 +2490,41 @@ class BTCProbabilityAlertApp:
             "vol_1m": 0.0,
             "vol_5m": 0.0,
             "vol_15m": 0.0,
+            "realized_vol_30": 0.55,
+            "realized_vol_60": 0.55,
+            "realized_vol_120": 0.55,
             "vwap_deviation": 0.0,
             "distance_to_vwap": 0.0,
             "distance_to_high_15m": 0.0,
             "distance_to_low_15m": 0.0,
             "volume_spike": 1.0,
             "local_range_break": 0.0,
+            "atr_14": 0.0,
+            "vol_ma_20": 0.0,
+            "vol_surge": 0.0,
+            "vol_change": 0.0,
             "ema_3": 0.0,
             "ema_5": 0.0,
             "ema_10": 0.0,
+            "ema20_raw": 0.0,
+            "ema100_raw": 0.0,
+            "ema20_slope_raw": 0.0,
+            "adx14_raw": 0.0,
+            "ema20": 0.0,
+            "ema100": 0.0,
+            "ema20_slope": 0.0,
+            "adx14": 0.0,
             "price_minus_ema_3": 0.0,
             "price_minus_ema_10": 0.0,
             "ema_3_minus_ema_10": 0.0,
+            "ret_1": 0.0,
+            "ret_5": 0.0,
+            "ret_15": 0.0,
+            "ret_30": 0.0,
+            "ret_60": 0.0,
+            "mom_5_15": 0.0,
+            "mom_15_60": 0.0,
+            "vol_cluster": 1.0,
         }
 
         if df.empty or len(df) < 50:
@@ -2042,6 +2532,11 @@ class BTCProbabilityAlertApp:
             return out
 
         close = df["close"]
+        out["open"] = float(df["open"].iloc[-1])
+        out["high"] = float(df["high"].iloc[-1])
+        out["low"] = float(df["low"].iloc[-1])
+        out["close"] = float(close.iloc[-1])
+        out["volume"] = float(df["volume"].iloc[-1])
         rets = np.log(close / close.shift(1)).dropna()
         if rets.empty:
             return out
@@ -2063,18 +2558,35 @@ class BTCProbabilityAlertApp:
         out["return_1m"] = _ret_n(1)
         out["return_3m"] = _ret_n(3)
         out["return_5m"] = _ret_n(5)
+        out["return_15m"] = _ret_n(15)
+        out["return_30m"] = _ret_n(30)
+        out["return_60m"] = _ret_n(60)
         out["return_10m"] = _ret_n(10)
         out["momentum_acceleration"] = float(out["return_1m"] - out["return_5m"])
+        out["ret_1"] = out["return_1m"]
+        out["ret_5"] = out["return_5m"]
+        out["ret_15"] = out["return_15m"]
+        out["ret_30"] = out["return_30m"]
+        out["ret_60"] = out["return_60m"]
+        out["mom_5_15"] = float(out["ret_5"] - out["ret_15"])
+        out["mom_15_60"] = float(out["ret_15"] - out["ret_60"])
 
         scale = math.sqrt((365.0 * 24.0 * 60.0) / float(candle_minutes))
         rv = float(rets.tail(min(len(rets), 288)).std(ddof=0) * scale)
         rv_short = float(rets.tail(min(len(rets), 24)).std(ddof=0) * scale)
+        rv_30 = float(rets.tail(min(len(rets), 30)).std(ddof=0) * scale)
+        rv_60 = float(rets.tail(min(len(rets), 60)).std(ddof=0) * scale)
+        rv_120 = float(rets.tail(min(len(rets), 120)).std(ddof=0) * scale)
 
         out["realized_vol_annual"] = max(rv, 0.08)
         out["realized_vol_expansion"] = (rv_short / (rv + EPS)) - 1.0
         out["vol_1m"] = float(rets.tail(min(len(rets), max(3, int(round(1 / max(candle_minutes, 1)))))).std(ddof=0) * scale)
         out["vol_5m"] = float(rets.tail(min(len(rets), max(5, int(round(5 / max(candle_minutes, 1)))))).std(ddof=0) * scale)
         out["vol_15m"] = float(rets.tail(min(len(rets), max(15, int(round(15 / max(candle_minutes, 1)))))).std(ddof=0) * scale)
+        out["realized_vol_30"] = max(rv_30, 0.08)
+        out["realized_vol_60"] = max(rv_60, 0.08)
+        out["realized_vol_120"] = max(rv_120, 0.08)
+        out["vol_cluster"] = float(max(out["realized_vol_30"], 1e-6) / max(out["realized_vol_120"], 1e-6))
 
         bars_4h = max(2, 240 // candle_minutes)
         bars_2h = max(2, 120 // candle_minutes)
@@ -2094,6 +2606,10 @@ class BTCProbabilityAlertApp:
         vol = df["volume"].tail(bars_4h)
         if len(vol) >= 10:
             out["volume_spike"] = float(vol.iloc[-1] / (vol.median() + EPS))
+        out["vol_ma_20"] = float(df["volume"].tail(min(len(df), 20)).mean())
+        out["vol_surge"] = float(out["volume_spike"] - 1.0)
+        if len(df["volume"]) >= 2 and float(df["volume"].iloc[-2]) != 0.0:
+            out["vol_change"] = float(df["volume"].iloc[-1] / df["volume"].iloc[-2] - 1.0)
 
         recent_high = float(df["high"].tail(bars_2h).max())
         recent_low = float(df["low"].tail(bars_2h).min())
@@ -2111,6 +2627,21 @@ class BTCProbabilityAlertApp:
         out["ema_3"] = ema3
         out["ema_5"] = ema5
         out["ema_10"] = ema10
+        ema20 = float(close.ewm(span=20, adjust=False).mean().iloc[-1])
+        ema100 = float(close.ewm(span=100, adjust=False).mean().iloc[-1])
+        out["ema20_raw"] = ema20
+        out["ema100_raw"] = ema100
+        out["ema20"] = float((last_close - ema20) / (last_close + EPS))
+        out["ema100"] = float((last_close - ema100) / (last_close + EPS))
+        if len(close) >= 2:
+            ema20_prev = float(close.iloc[:-1].ewm(span=20, adjust=False).mean().iloc[-1])
+            out["ema20_slope_raw"] = float((ema20 - ema20_prev) / (last_close + EPS))
+            out["ema20_slope"] = out["ema20_slope_raw"]
+        high_low = (df["high"] - df["low"]).tail(min(len(df), 14))
+        out["atr_14"] = float(high_low.mean()) if not high_low.empty else 0.0
+        atr_base = max(last_close, EPS)
+        out["adx14_raw"] = float(min((out["atr_14"] / atr_base) * 1000.0, 100.0))
+        out["adx14"] = float(out["adx14_raw"] / 100.0)
         out["price_minus_ema_3"] = float((last_close - ema3) / (last_close + EPS))
         out["price_minus_ema_10"] = float((last_close - ema10) / (last_close + EPS))
         out["ema_3_minus_ema_10"] = float((ema3 - ema10) / (last_close + EPS))
@@ -2794,10 +3325,22 @@ class BTCProbabilityAlertApp:
         print(f"Timeframe: {result['timeframe_minutes']} minutes")
         print(f"Expected Return: {result['expected_return'] * 100:.4f}%")
         print(f"Expected Price: ${result['expected_price']:,.2f}")
+        print(
+            f"Raw/Calibrated Prob Up: "
+            f"{result['raw_model_probability'] * 100:.2f}% / {result['calibrated_probability'] * 100:.2f}%"
+        )
         print(f"Prob Up/Down: {result['prob_up'] * 100:.2f}% / {result['prob_down'] * 100:.2f}%")
+        print(f"Raw Model Score: {result['raw_model_score']:.4f}")
         print(f"Confidence: {result['confidence_score']:.3f}")
         print(f"Signal Strength: {result['signal_strength']:.3f}")
         print(f"Signal: {result['signal']}")
+        print(
+            f"Thresholds Long/Short: "
+            f"{result['long_threshold']:.3f} / {result['short_threshold']:.3f}"
+        )
+        print(f"No-Trade Reason: {result['no_trade_reason']}")
+        print(f"Calibration: {result['calibration_method']} ({result['calibration_source']})")
+        print(f"Model: {result['model_type']} ({result['model_artifact_path']})")
         print(f"Leverage: {result['leverage']:.1f}x")
         if result.get("take_profit") is not None:
             print(f"Entry: ${result['entry_price']:,.2f}")
@@ -2899,9 +3442,14 @@ class BTCProbabilityAlertApp:
             f"**Timeframe:** {result['timeframe_minutes']} minutes",
             f"**Expected Return:** {result['expected_return'] * 100:.4f}%",
             f"**Expected Price:** ${result['expected_price']:,.2f}",
+            f"**Raw Score:** {result['raw_model_score']:.4f}",
+            f"**Raw/Calibrated Prob Up:** {result['raw_model_probability'] * 100:.2f}% / {result['calibrated_probability'] * 100:.2f}%",
             f"**Prob Up/Down:** {result['prob_up'] * 100:.2f}% / {result['prob_down'] * 100:.2f}%",
             f"**Confidence:** {result['confidence_score']:.3f}",
             f"**Signal Strength:** {result['signal_strength']:.3f}",
+            f"**Thresholds Long/Short:** {result['long_threshold']:.3f} / {result['short_threshold']:.3f}",
+            f"**No Trade Reason:** {result['no_trade_reason']}",
+            f"**Calibration:** {result['calibration_method']}",
             f"**Signal:** {direction}",
             f"**Leverage:** {result['leverage']:.1f}x",
         ]
@@ -3095,11 +3643,21 @@ class BTCProbabilityAlertApp:
             "spot_price": result["spot_price"],
             "expected_return": result["expected_return"],
             "expected_price": result["expected_price"],
+            "raw_model_score": result["raw_model_score"],
+            "raw_model_probability": result["raw_model_probability"],
+            "calibrated_probability": result["calibrated_probability"],
             "prob_up": result["prob_up"],
             "prob_down": result["prob_down"],
             "confidence_score": result["confidence_score"],
             "signal_strength": result["signal_strength"],
             "signal": result["signal"],
+            "signal_side": result["signal_side"],
+            "no_trade_reason": result["no_trade_reason"],
+            "threshold_used": json.dumps(result["threshold_used"], sort_keys=True)
+            if isinstance(result.get("threshold_used"), dict)
+            else result.get("threshold_used"),
+            "long_threshold": result["long_threshold"],
+            "short_threshold": result["short_threshold"],
             "entry_price": result["entry_price"],
             "take_profit": result.get("take_profit"),
             "stop_loss": result.get("stop_loss"),
@@ -3121,7 +3679,17 @@ class BTCProbabilityAlertApp:
             "stop_within_liquidation_buffer": result.get("stop_within_liquidation_buffer"),
             "realized_volatility": result["realized_volatility"],
             "expected_move": result["expected_move"],
+            "model_artifact_path": result["model_artifact_path"],
+            "model_type": result["model_type"],
+            "calibration_method": result["calibration_method"],
+            "calibration_source": result["calibration_source"],
+            "ema20_raw": result["factors"].get("ema20_raw"),
+            "ema100_raw": result["factors"].get("ema100_raw"),
+            "feature_count": result["feature_count"],
+            "live_diagnostics_json": json.dumps(result["live_diagnostics"], sort_keys=True),
             "resolution_due_utc": result["resolution_due_utc"],
+            "resolved": result.get("resolved", False),
+            "resolved_price": result.get("resolved_price"),
         }
 
         header = list(row.keys())
@@ -3255,6 +3823,14 @@ class BTCProbabilityAlertApp:
             "realized_direction_up",
             "prob_up",
             "resolved",
+            "raw_model_probability",
+            "calibrated_probability",
+            "entry_price",
+            "resolved_price",
+            "leverage",
+            "fee_roundtrip_bps",
+            "ema20_raw",
+            "ema100_raw",
         ]:
             if c not in df.columns:
                 df[c] = np.nan
@@ -3266,6 +3842,13 @@ class BTCProbabilityAlertApp:
         df["realized_pnl_pct_levered_net"] = pd.to_numeric(df["realized_pnl_pct_levered_net"], errors="coerce")
         df["realized_direction_up"] = pd.to_numeric(df["realized_direction_up"], errors="coerce")
         df["prob_up"] = pd.to_numeric(df["prob_up"], errors="coerce")
+        df["raw_model_probability"] = pd.to_numeric(df["raw_model_probability"], errors="coerce")
+        df["calibrated_probability"] = pd.to_numeric(df["calibrated_probability"], errors="coerce")
+        df["entry_price"] = pd.to_numeric(df["entry_price"], errors="coerce")
+        df["resolved_price"] = pd.to_numeric(df["resolved_price"], errors="coerce")
+        df["leverage"] = pd.to_numeric(df["leverage"], errors="coerce").fillna(1.0)
+        df["fee_roundtrip_bps"] = pd.to_numeric(df["fee_roundtrip_bps"], errors="coerce").fillna(0.0)
+        df["base_move"] = (df["resolved_price"] - df["entry_price"]) / df["entry_price"].replace(0.0, np.nan)
 
         mask = df["resolved_bool"]
         if not include_no_trade:
@@ -3304,6 +3887,54 @@ class BTCProbabilityAlertApp:
             if bool(m.any()):
                 directional_acc = float(np.mean(pred_up[m].to_numpy(dtype=int) == actual_up[m].to_numpy(dtype=int)))
 
+        long_count = int((trades["signal"] == "LONG").sum()) if not trades.empty else 0
+        short_count = int((trades["signal"] == "SHORT").sum()) if not trades.empty else 0
+        imbalance_ratio = (
+            float(max(long_count, short_count) / max(long_count + short_count, 1))
+            if (long_count + short_count) > 0
+            else None
+        )
+        prob_series = scored["prob_up"].dropna().round(4)
+        unique_prob_count = int(prob_series.nunique()) if not prob_series.empty else 0
+        bucketed_warning = bool(len(prob_series) >= 25 and unique_prob_count <= 5)
+        calibration_gap = (scored["calibrated_probability"] - scored["raw_model_probability"]).abs().dropna()
+        calibration_gap_mean = float(calibration_gap.mean()) if not calibration_gap.empty else None
+        calibration_warning = bool(calibration_gap_mean is not None and calibration_gap_mean >= 0.20)
+
+        resolved_all = df[df["resolved_bool"]].copy()
+        base_move = resolved_all["base_move"].dropna()
+        baselines: Dict[str, Any] = {
+            "no_trade": {"trades": int(len(resolved_all)), "avg_pnl_pct_levered_net": 0.0, "total_pnl_pct_levered_net": 0.0}
+        }
+        if not base_move.empty:
+            lev = resolved_all.loc[base_move.index, "leverage"].to_numpy(dtype=float)
+            fee = resolved_all.loc[base_move.index, "fee_roundtrip_bps"].to_numpy(dtype=float) / 10000.0
+            long_pnl = base_move.to_numpy(dtype=float) * lev - fee
+            baselines["always_long"] = {
+                "trades": int(len(long_pnl)),
+                "avg_pnl_pct_levered_net": float(np.mean(long_pnl)),
+                "total_pnl_pct_levered_net": float(np.sum(long_pnl)),
+            }
+            ema_mask = resolved_all["ema20_raw"].notna() & resolved_all["ema100_raw"].notna() & resolved_all["base_move"].notna()
+            if bool(ema_mask.any()):
+                ema_df = resolved_all.loc[ema_mask].copy()
+                ema_signal = np.where(ema_df["ema20_raw"] > ema_df["ema100_raw"], "LONG", "SHORT")
+                ema_move = np.where(ema_signal == "LONG", ema_df["base_move"], -ema_df["base_move"])
+                ema_fee = ema_df["fee_roundtrip_bps"].to_numpy(dtype=float) / 10000.0
+                ema_lev = ema_df["leverage"].to_numpy(dtype=float)
+                ema_pnl = ema_move.astype(float) * ema_lev - ema_fee
+                baselines["ema_crossover"] = {
+                    "trades": int(len(ema_pnl)),
+                    "avg_pnl_pct_levered_net": float(np.mean(ema_pnl)),
+                    "total_pnl_pct_levered_net": float(np.sum(ema_pnl)),
+                }
+        high_conf = trades[trades["confidence_score"] >= 0.75].copy() if not trades.empty else pd.DataFrame()
+        baselines["high_confidence_only"] = {
+            "trades": int(len(high_conf)),
+            "avg_pnl_pct_levered_net": float(high_conf["realized_pnl_pct_levered_net"].mean()) if not high_conf.empty else None,
+            "total_pnl_pct_levered_net": float(high_conf["realized_pnl_pct_levered_net"].sum()) if not high_conf.empty else None,
+        }
+
         summary = {
             "status": "ok",
             "rows_total": int(len(df)),
@@ -3324,6 +3955,21 @@ class BTCProbabilityAlertApp:
             "gross_loss_pct": gross_loss,
             "profit_factor": profit_factor,
             "plus_ev_by_realized_mean": bool(float(np.mean(pnl)) > 0.0),
+            "signal_distribution": {
+                "long_count": long_count,
+                "short_count": short_count,
+                "dominant_side_ratio": imbalance_ratio,
+                "extreme_imbalance_warning": bool(imbalance_ratio is not None and imbalance_ratio >= 0.85),
+            },
+            "probability_health": {
+                "unique_probabilities_4dp": unique_prob_count,
+                "bucketed_probability_warning": bucketed_warning,
+            },
+            "calibration_health": {
+                "mean_abs_calibration_gap": calibration_gap_mean,
+                "calibration_warning": calibration_warning,
+            },
+            "baselines": baselines,
         }
 
         out_path = self.latest_dir / "futures_backtest_report.json"
@@ -3343,6 +3989,20 @@ class BTCProbabilityAlertApp:
         print(f"Median PnL (levered, net fees): {summary['median_pnl_pct_levered_net'] * 100:.3f}%")
         print(f"Total PnL (levered, net fees): {summary['total_pnl_pct_levered_net'] * 100:.3f}%")
         print(f"Profit Factor: {summary['profit_factor'] if summary['profit_factor'] is not None else 'n/a'}")
+        print(
+            f"Signal Distribution LONG/SHORT: "
+            f"{summary['signal_distribution']['long_count']} / {summary['signal_distribution']['short_count']}"
+        )
+        print(
+            f"Probability Health Unique(4dp)/Bucketed: "
+            f"{summary['probability_health']['unique_probabilities_4dp']} / "
+            f"{summary['probability_health']['bucketed_probability_warning']}"
+        )
+        print(
+            f"Calibration Mean Abs Gap / Warning: "
+            f"{summary['calibration_health']['mean_abs_calibration_gap']} / "
+            f"{summary['calibration_health']['calibration_warning']}"
+        )
         print(f"Plus EV (realized mean > 0): {summary['plus_ev_by_realized_mean']}")
         print(f"Saved report: {out_path}")
 
@@ -3626,6 +4286,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--min-confidence", default=0.52, type=float, help="Futures mode minimum confidence score")
     parser.add_argument("--min-signal-strength", default=0.10, type=float, help="Futures mode minimum signal strength")
     parser.add_argument("--prob-threshold", default=0.55, type=float, help="Futures mode probability threshold for long/short")
+    parser.add_argument("--prob-long-threshold", default=None, type=float, help="Futures mode explicit LONG entry threshold")
+    parser.add_argument("--prob-short-threshold", default=None, type=float, help="Futures mode explicit SHORT entry threshold")
     parser.add_argument("--take-profit-mult", default=1.20, type=float, help="Futures mode take-profit multiplier")
     parser.add_argument("--stop-loss-mult", default=0.70, type=float, help="Futures mode stop-loss multiplier")
     parser.add_argument("--contract-check", action="store_true", help="Futures mode: include liquidation-buffer and fee-aware contract risk checks")
@@ -3717,6 +4379,8 @@ def main() -> None:
             min_confidence=args.min_confidence,
             min_signal_strength=args.min_signal_strength,
             prob_threshold=args.prob_threshold,
+            prob_long_threshold=args.prob_long_threshold,
+            prob_short_threshold=args.prob_short_threshold,
             take_profit_mult=args.take_profit_mult,
             stop_loss_mult=args.stop_loss_mult,
             contract_check=args.contract_check,
